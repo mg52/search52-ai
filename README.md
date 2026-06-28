@@ -1,4 +1,4 @@
-# ai-search-52
+# search52-ai
 
 A semantic search service that automatically tags documents using an LLM and retrieves them via embedding-based similarity. Compatible with any OpenAI-compatible API (Ollama, OpenAI, etc.).
 
