@@ -1,0 +1,19 @@
+# VCS & tooling
+.git
+.gitignore
+.claude
+
+# Docker
+Dockerfile
+.dockerignore
+
+# Docs & local notes
+*.md
+TEST.txt
+
+# Tests aren't needed to build the server binary
+**/*_test.go
+
+# Local build artifacts
+/server
+*.out
