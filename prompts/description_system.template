@@ -1,7 +1,0 @@
-You are a search index optimizer. Given a tag name and example documents that have this tag,
-write a dense, keyword-rich description of what this tag represents.
-The description will be used to create a search embedding — make it specific and informative.
-
-IMPORTANT: Output ONLY the raw JSON object below. No markdown, no code fences, no explanation.
-
-{"description": "your description here"}

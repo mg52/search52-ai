@@ -18,20 +18,13 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	prompts, err := ai.LoadPrompts(cfg.PromptsDir)
-	if err != nil {
-		log.Fatalf("prompts: %v", err)
-	}
-
 	st := store.NewMemoryStore()
-	llm := ai.NewLLMClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
 	emb := ai.NewEmbeddingClient(cfg.EmbeddingBaseURL, cfg.EmbeddingAPIKey, cfg.EmbeddingModel)
 
-	embedder := pipeline.NewEmbedder(llm, emb, prompts, st)
-	tagger := pipeline.NewTagger(llm, emb, prompts, st, cfg.MaxTagsPerDoc, cfg.TagMatchThreshold, embedder)
-	searcher := search.NewEngine(emb, st, cfg.TagMatchThreshold)
+	categorizer := pipeline.NewCategorizer(emb, st, cfg.CategoryThreshold, cfg.MaxCategoriesPerDoc, cfg.MaxCategories)
+	searcher := search.NewEngine(emb, st, cfg.TopNCategories)
 
-	h := handler.New(st, tagger, searcher)
+	h := handler.New(st, categorizer, searcher)
 
 	addr := ":" + cfg.Port
 	log.Printf("listening on %s", addr)

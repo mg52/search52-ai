@@ -1,37 +1,42 @@
 # search52-ai
 
-A semantic search service that automatically tags documents using an LLM and retrieves them via embedding-based similarity. Compatible with any OpenAI-compatible API (Ollama, OpenAI, etc.).
+A semantic search service that **automatically clusters documents into categories**
+by vector similarity and retrieves them via embedding search. No LLM is involved —
+only an embedding model. Compatible with any OpenAI-compatible embeddings API
+(Ollama, OpenAI, etc.).
 
 ## How it works
 
-Documents are indexed through a two-phase pipeline:
+Documents are indexed through a single embedding pipeline (`POST /documents`):
 
-**Phase 1 — Tagging** (`POST /documents/llm`)
-The document content is sent to an LLM alongside the current tag list. The LLM reuses existing tags where possible, and creates new ones only when needed. Tags are lowercase snake_case category names (e.g. `noise_cancelling_headphones`, `medical_equipment`).
+**Embed** — the document content is embedded once into a dense vector.
 
-**Phase 2 — Tag embedding** (background)
-For each newly created tag, the LLM generates a keyword-rich description using the document that triggered the tag as an example. That description is then embedded into a vector and stored alongside the tag.
+**Incremental categorization** — the vector is compared against the centroids of
+existing categories. It joins every category whose cosine similarity is at least
+`CATEGORY_THRESHOLD` (up to `MAX_CATEGORIES_PER_DOC`, highest first). If none are
+close enough, a new category is created (auto-named `category1`, `category2`, …),
+unless the `MAX_CATEGORIES` cap is reached — in which case the document falls back
+to its single nearest category so everything stays categorized. Each category's
+centroid is the running mean of its members and is updated on every add/remove,
+so categories drift to track their contents.
 
-**Embedding-only path** (`POST /documents/embed`)
-Once tags have vectors, new documents can be tagged without an LLM call. The document is embedded and matched against existing tag vectors via cosine similarity. No new tags are ever created this way.
-
-**Search** (`POST /search`)
-The query is embedded and compared against all tag vectors. Tags above the similarity threshold are matched; documents holding those tags are scored and ranked. The final score combines the top tag similarity and the proportion of matched tags:
+**Search** (`POST /search`) — the query is embedded, the `TOP_N_CATEGORIES`
+nearest category centroids are selected, and their member documents are ranked by
+cosine similarity of the query to each document's own vector:
 
 ```
-score = (max_tag_similarity × vector_weight) + (matched_tags/total_tags × tag_weight)
+score = cosine(query_vector, document_vector)
 ```
 
-The response is an object with two fields: `documents` (the ranked results, each with its own `matched_tags`) and a top-level `matched_tags` — the full list of tags the query matched, with per-tag similarity, sorted by score and independent of any document.
+The response has two fields: `documents` (ranked results, each with its
+`categories`) and `matched_categories` (the nearest categories to the query, with
+per-category similarity).
 
 ## Quickstart
 
-Requires an OpenAI-compatible LLM and embedding endpoint (e.g. Ollama).
+Requires an OpenAI-compatible embedding endpoint (e.g. Ollama). No LLM needed.
 
 ```bash
-LLM_BASE_URL=http://localhost:11434/v1 \
-LLM_API_KEY=ollama \
-LLM_MODEL=qwen2.5:3b \
 EMBEDDING_BASE_URL=http://localhost:11434/v1 \
 EMBEDDING_API_KEY=ollama \
 EMBEDDING_MODEL=nomic-embed-text \
@@ -47,51 +52,45 @@ The image is a multi-stage build producing a static binary on `distroless/static
 docker build -t search52-ai .
 
 docker run --rm -p 8080:8080 \
-  -e LLM_BASE_URL=http://host.docker.internal:11434/v1 \
-  -e LLM_API_KEY=ollama \
-  -e LLM_MODEL=qwen2.5:3b \
   -e EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1 \
   -e EMBEDDING_API_KEY=ollama \
   -e EMBEDDING_MODEL=nomic-embed-text \
   search52-ai
 ```
 
-Prompt templates are baked into the image at `/app/prompts` (`PROMPTS_DIR`). The container
-exposes `8080`; point your orchestrator's liveness/readiness probe at `GET /health`.
+The container exposes `8080`; point your orchestrator's liveness/readiness probe
+at `GET /health`.
 
 ## Configuration
 
-| Variable              | Default      | Description                                  |
-|-----------------------|--------------|----------------------------------------------|
-| `LLM_BASE_URL`        | required     | Base URL for the LLM (OpenAI-compatible)     |
-| `LLM_API_KEY`         | required     | API key (`ollama` for local Ollama)          |
-| `LLM_MODEL`           | required     | Model name for tagging and description tasks |
-| `EMBEDDING_BASE_URL`  | required     | Base URL for the embedding model             |
-| `EMBEDDING_API_KEY`   | required     | API key for the embedding endpoint           |
-| `EMBEDDING_MODEL`     | required     | Embedding model name                         |
-| `PORT`                | `8080`       | HTTP port                                    |
-| `PROMPTS_DIR`         | `./prompts`  | Directory containing prompt templates        |
-| `MAX_TAGS_PER_DOC`    | `8`          | Maximum tags assigned per document           |
-| `TAG_MATCH_THRESHOLD` | `0.60`       | Minimum cosine similarity to match a tag     |
+| Variable                 | Default   | Description                                          |
+|--------------------------|-----------|------------------------------------------------------|
+| `EMBEDDING_BASE_URL`     | required  | Base URL for the embedding model (OpenAI-compatible) |
+| `EMBEDDING_MODEL`        | required  | Embedding model name                                 |
+| `EMBEDDING_API_KEY`      | optional  | API key (`ollama` locally; omit if unauthenticated)  |
+| `PORT`                   | `8080`    | HTTP port                                            |
+| `CATEGORY_THRESHOLD`     | `0.60`    | Min cosine similarity to join an existing category   |
+| `MAX_CATEGORIES_PER_DOC` | `3`       | Max categories a single document may join            |
+| `MAX_CATEGORIES`         | `100`     | Cap on the total number of categories                |
+| `TOP_N_CATEGORIES`       | `3`       | Nearest categories scanned per query                 |
 
 ## API
 
 | Method | Path                  | Description                                          |
 |--------|-----------------------|------------------------------------------------------|
-| POST   | `/documents/llm`      | Index a document via LLM tagging                     |
-| POST   | `/documents/embed`    | Index a document via embedding similarity (no LLM)   |
+| POST   | `/documents`          | Embed and categorize a document                      |
 | GET    | `/documents`          | List documents (`?page=1&size=20`)                   |
 | GET    | `/documents/{id}`     | Get a single document                                |
-| PUT    | `/documents/{id}`     | Replace a document's content and re-tag it via LLM   |
-| DELETE | `/documents/{id}`     | Delete a document and its tag associations           |
-| GET    | `/tags`               | List all tags with status and description            |
-| GET    | `/tags/{name}`        | Get tag detail including example documents           |
+| PUT    | `/documents/{id}`     | Replace a document's content and re-categorize it    |
+| DELETE | `/documents/{id}`     | Delete a document and its category memberships       |
+| GET    | `/categories`         | List all categories with document counts             |
+| GET    | `/categories/{name}`  | Get category detail                                  |
 | POST   | `/search`             | Semantic search                                      |
 | GET    | `/health`             | Service status                                       |
 
 **Index a document**
 ```bash
-curl -X POST http://localhost:8080/documents/llm \
+curl -X POST http://localhost:8080/documents \
   -H "Content-Type: application/json" \
   -d '{"id": "doc1", "content": "Sony WH-1000XM5 Wireless Noise Cancelling Headphones..."}'
 ```
@@ -100,7 +99,7 @@ curl -X POST http://localhost:8080/documents/llm \
 ```bash
 curl -X POST http://localhost:8080/search \
   -H "Content-Type: application/json" \
-  -d '{"q": "wireless noise cancelling audio", "limit": 5, "vector_weight": 0.6, "tag_weight": 0.4}'
+  -d '{"q": "wireless noise cancelling audio", "limit": 5}'
 ```
 
 Response:
@@ -108,14 +107,13 @@ Response:
 {
   "documents": [
     {
-      "document": { "id": "doc1", "content": "...", "tags": ["..."] },
+      "document": { "id": "doc1", "content": "...", "categories": ["category1"] },
       "score": 0.78,
-      "matched_tags": ["noise_cancelling_headphones", "wireless_headphones"]
+      "categories": ["category1"]
     }
   ],
-  "matched_tags": [
-    { "tag": "noise_cancelling_headphones", "score": 0.82 },
-    { "tag": "wireless_headphones", "score": 0.74 }
+  "matched_categories": [
+    { "name": "category1", "score": 0.82 }
   ]
 }
 ```
@@ -123,26 +121,25 @@ Response:
 ## Architecture
 
 ```
-POST /documents/llm
-  └── LLM (existing tags + content) → assigned tags
-        └── new tags → background: LLM description → embedding → stored
-
-POST /documents/embed
-  └── embed(content) → cosine similarity vs tag vectors → threshold filter → assigned tags
+POST /documents
+  └── embed(content) → cosine vs category centroids
+        ├── ≥ threshold → join nearest categories (≤ MAX_CATEGORIES_PER_DOC)
+        └── otherwise   → new category (or nearest, if MAX_CATEGORIES reached)
+              └── update category centroid (running mean)
 
 POST /search
-  └── embed(query) → matching tags → documents → scored & ranked
-        └── returns { documents, matched_tags } (matched_tags = query↔tag scores)
+  └── embed(query) → TOP_N_CATEGORIES nearest centroids
+        └── member docs ranked by cosine(query, doc_vector)
+              └── returns { documents, matched_categories }
 ```
 
 The store is in-memory; all data is lost on restart.
 
 ## TODO
 
-- **Persistent storage** — swap the in-memory store for SQLite or PostgreSQL; add pgvector for tag vectors
-- **Tag deduplication** — detect and merge near-duplicate tags (e.g. `headphones` / `headphone` / `noisecancelling_headphones`) using embedding similarity at creation time
-- **Tag quality guard** — reject and retry description generation when the LLM echoes the tag name back as the description
-- **Separate LLM and description models** — allow configuring a smaller/faster model for tagging and a larger model for description generation
-- **Bulk ingestion** — `POST /documents/batch` with concurrent tagging and back-pressure
-- **Incremental re-embedding** — re-embed tag descriptions when new examples accumulate, without a full restart
-- **Search filters** — filter results by tag, date range, or minimum score
+- **Persistent storage** — swap the in-memory store for SQLite/PostgreSQL (+ pgvector for centroids and document vectors)
+- **Category merging** — detect and merge categories whose centroids drift close together over time
+- **Recall tuning** — expose per-query `top_n` override; consider scanning more categories when the nearest are weak
+- **Bulk ingestion** — `POST /documents/batch` with concurrent embedding and back-pressure
+- **Search filters** — filter results by category, date range, or minimum score
+```

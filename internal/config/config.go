@@ -7,53 +7,54 @@ import (
 )
 
 type Config struct {
-	LLMBaseURL        string
-	LLMAPIKey         string
-	LLMModel          string
-	EmbeddingBaseURL  string
-	EmbeddingAPIKey   string
-	EmbeddingModel    string
-	Port              string
-	MaxTagsPerDoc     int
-	TagMatchThreshold float64
-	PromptsDir        string
+	EmbeddingBaseURL string
+	EmbeddingAPIKey  string
+	EmbeddingModel   string
+	Port             string
+
+	// Categorization / search tuning.
+	CategoryThreshold   float64 // min cosine to join an existing category
+	MaxCategoriesPerDoc int     // cap on categories one document may join
+	MaxCategories       int     // cap on total categories
+	TopNCategories      int     // nearest categories scanned per query
 }
 
 func Load() (*Config, error) {
 	c := &Config{}
 
 	var missing []string
-	getRequired := func(key string) string {
-		v := os.Getenv(key)
-		if v == "" {
-			missing = append(missing, key)
-		}
-		return v
-	}
+	// getRequired := func(key string) string {
+	// 	v := os.Getenv(key)
+	// 	if v == "" {
+	// 		missing = append(missing, key)
+	// 	}
+	// 	return v
+	// }
 
-	c.LLMBaseURL = getRequired("LLM_BASE_URL")
-	c.LLMAPIKey = getRequired("LLM_API_KEY")
-	c.LLMModel = getRequired("LLM_MODEL")
-	c.EmbeddingBaseURL = getRequired("EMBEDDING_BASE_URL")
-	c.EmbeddingAPIKey = getRequired("EMBEDDING_API_KEY")
-	c.EmbeddingModel = getRequired("EMBEDDING_MODEL")
+	// c.EmbeddingBaseURL = getRequired("EMBEDDING_BASE_URL")
+	c.EmbeddingBaseURL = "http://localhost:11434/v1"
+	c.EmbeddingAPIKey = os.Getenv("EMBEDDING_API_KEY") // optional (e.g. local Ollama)
+	// c.EmbeddingModel = getRequired("EMBEDDING_MODEL")
+	c.EmbeddingModel = "nomic-embed-text"
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %v", missing)
 	}
 
 	c.Port = getEnvDefault("PORT", "8080")
-	c.PromptsDir = getEnvDefault("PROMPTS_DIR", "./prompts")
 
 	var err error
-	c.MaxTagsPerDoc, err = strconv.Atoi(getEnvDefault("MAX_TAGS_PER_DOC", "8"))
-	if err != nil {
-		return nil, fmt.Errorf("invalid MAX_TAGS_PER_DOC: %w", err)
+	if c.CategoryThreshold, err = parseFloat("CATEGORY_THRESHOLD", "0.60"); err != nil {
+		return nil, err
 	}
-
-	c.TagMatchThreshold, err = strconv.ParseFloat(getEnvDefault("TAG_MATCH_THRESHOLD", "0.60"), 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid TAG_MATCH_THRESHOLD: %w", err)
+	if c.MaxCategoriesPerDoc, err = parseInt("MAX_CATEGORIES_PER_DOC", "3"); err != nil {
+		return nil, err
+	}
+	if c.MaxCategories, err = parseInt("MAX_CATEGORIES", "100"); err != nil {
+		return nil, err
+	}
+	if c.TopNCategories, err = parseInt("TOP_N_CATEGORIES", "3"); err != nil {
+		return nil, err
 	}
 
 	return c, nil
@@ -64,4 +65,20 @@ func getEnvDefault(key, def string) string {
 		return v
 	}
 	return def
+}
+
+func parseInt(key, def string) (int, error) {
+	n, err := strconv.Atoi(getEnvDefault(key, def))
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return n, nil
+}
+
+func parseFloat(key, def string) (float64, error) {
+	f, err := strconv.ParseFloat(getEnvDefault(key, def), 64)
+	if err != nil {
+		return 0, fmt.Errorf("invalid %s: %w", key, err)
+	}
+	return f, nil
 }

@@ -11,27 +11,14 @@ import (
 	"time"
 )
 
-type LLMClient struct {
-	baseURL string
-	apiKey  string
-	model   string
-	http    *http.Client
-}
-
+// EmbeddingClient calls an OpenAI-compatible /embeddings endpoint. The same
+// endpoint is exposed by OpenAI and by Ollama's OpenAI-compatible API (base URL
+// typically ".../v1").
 type EmbeddingClient struct {
 	baseURL string
 	apiKey  string
 	model   string
 	http    *http.Client
-}
-
-func NewLLMClient(baseURL, apiKey, model string) *LLMClient {
-	return &LLMClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		model:   model,
-		http:    &http.Client{Timeout: 60 * time.Second},
-	}
 }
 
 func NewEmbeddingClient(baseURL, apiKey, model string) *EmbeddingClient {
@@ -41,45 +28,6 @@ func NewEmbeddingClient(baseURL, apiKey, model string) *EmbeddingClient {
 		model:   model,
 		http:    &http.Client{Timeout: 60 * time.Second},
 	}
-}
-
-type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-}
-
-type chatMessage struct {
-	Role    string `json:"role"`
-	Content string `json:"content"`
-}
-
-type chatResponse struct {
-	Choices []struct {
-		Message struct {
-			Content string `json:"content"`
-		} `json:"message"`
-	} `json:"choices"`
-}
-
-func (c *LLMClient) Complete(ctx context.Context, system, user string) (string, error) {
-	req := chatRequest{
-		Model: c.model,
-		Messages: []chatMessage{
-			{Role: "system", Content: system},
-			{Role: "user", Content: user},
-		},
-	}
-	var resp chatResponse
-	err := retry(ctx, 3, func() error {
-		return postJSON(ctx, c.http, c.baseURL+"/chat/completions", c.apiKey, req, &resp)
-	})
-	if err != nil {
-		return "", err
-	}
-	if len(resp.Choices) == 0 {
-		return "", fmt.Errorf("empty choices in LLM response")
-	}
-	return resp.Choices[0].Message.Content, nil
 }
 
 type embeddingRequest struct {
@@ -93,6 +41,8 @@ type embeddingResponse struct {
 	} `json:"data"`
 }
 
+// Embed returns the embedding vector for text, retrying transient failures with
+// exponential backoff.
 func (c *EmbeddingClient) Embed(ctx context.Context, text string) ([]float64, error) {
 	req := embeddingRequest{Input: text, Model: c.model}
 	var resp embeddingResponse
@@ -118,7 +68,9 @@ func postJSON(ctx context.Context, client *http.Client, url, apiKey string, body
 		return err
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+apiKey)
+	if apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+apiKey)
+	}
 
 	resp, err := client.Do(req)
 	if err != nil {

@@ -14,25 +14,24 @@ import (
 )
 
 type Handler struct {
-	store    store.Store
-	tagger   *pipeline.Tagger
-	searcher *search.Engine
+	store       store.Store
+	categorizer *pipeline.Categorizer
+	searcher    *search.Engine
 }
 
-func New(st store.Store, tagger *pipeline.Tagger, searcher *search.Engine) *Handler {
-	return &Handler{store: st, tagger: tagger, searcher: searcher}
+func New(st store.Store, categorizer *pipeline.Categorizer, searcher *search.Engine) *Handler {
+	return &Handler{store: st, categorizer: categorizer, searcher: searcher}
 }
 
 func (h *Handler) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /documents/llm", h.tagByLLM)
-	mux.HandleFunc("POST /documents/embed", h.tagByEmbed)
+	mux.HandleFunc("POST /documents", h.createDocument)
 	mux.HandleFunc("GET /documents/{id}", h.getDocument)
 	mux.HandleFunc("PUT /documents/{id}", h.updateDocument)
 	mux.HandleFunc("DELETE /documents/{id}", h.deleteDocument)
 	mux.HandleFunc("GET /documents", h.listDocuments)
-	mux.HandleFunc("GET /tags/{name}", h.getTag)
-	mux.HandleFunc("GET /tags", h.listTags)
+	mux.HandleFunc("GET /categories/{name}", h.getCategory)
+	mux.HandleFunc("GET /categories", h.listCategories)
 	mux.HandleFunc("POST /search", h.search)
 	mux.HandleFunc("GET /health", h.health)
 	return mux
@@ -43,62 +42,34 @@ type documentReq struct {
 	Content string `json:"content"`
 }
 
-func (h *Handler) parseDocumentReq(w http.ResponseWriter, r *http.Request) (store.Document, bool) {
+// createDocument embeds the document and clusters it into categories. No LLM is
+// involved; categories are discovered incrementally by vector similarity.
+func (h *Handler) createDocument(w http.ResponseWriter, r *http.Request) {
 	var req documentReq
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		jsonError(w, "invalid request body", http.StatusBadRequest)
-		return store.Document{}, false
+		return
 	}
 	if req.Content == "" {
 		jsonError(w, "content is required", http.StatusBadRequest)
-		return store.Document{}, false
+		return
 	}
 	if req.ID == "" {
 		req.ID = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	if _, exists := h.store.GetDocument(req.ID); exists {
 		jsonError(w, "document already exists", http.StatusConflict)
-		return store.Document{}, false
-	}
-	return store.Document{ID: req.ID, Content: req.Content, CreatedAt: time.Now()}, true
-}
-
-// tagByLLM sends the document to the LLM along with all existing tag names.
-// The LLM decides which existing tags apply and whether to create new ones.
-// New tags trigger background embedding generation (Phase 2).
-func (h *Handler) tagByLLM(w http.ResponseWriter, r *http.Request) {
-	doc, ok := h.parseDocumentReq(w, r)
-	if !ok {
 		return
 	}
 
-	doc, err := h.tagger.TagByLLM(r.Context(), doc)
+	doc := store.Document{ID: req.ID, Content: req.Content, CreatedAt: time.Now()}
+	doc, err := h.categorizer.Process(r.Context(), doc)
 	if err != nil {
-		log.Printf("handler: llm tagging %s: %v", doc.ID, err)
-		jsonError(w, "tagging failed: "+err.Error(), http.StatusInternalServerError)
+		log.Printf("handler: categorize %s: %v", doc.ID, err)
+		jsonError(w, "categorization failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	jsonResponse(w, doc, http.StatusCreated)
-}
-
-// tagByEmbed embeds the document content and assigns existing tags by cosine
-// similarity. No LLM is involved and no new tags are created.
-// Requires tags to already have vectors (use /documents/llm first to populate tags).
-func (h *Handler) tagByEmbed(w http.ResponseWriter, r *http.Request) {
-	doc, ok := h.parseDocumentReq(w, r)
-	if !ok {
-		return
-	}
-
-	result, err := h.tagger.TagByEmbedding(r.Context(), doc)
-	if err != nil {
-		log.Printf("handler: embed tagging %s: %v", doc.ID, err)
-		jsonError(w, "tagging failed: "+err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	jsonResponse(w, result, http.StatusCreated)
 }
 
 func (h *Handler) getDocument(w http.ResponseWriter, r *http.Request) {
@@ -111,9 +82,8 @@ func (h *Handler) getDocument(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, doc, http.StatusOK)
 }
 
-// updateDocument replaces a document's content and re-tags it through the LLM,
-// so its tags (and the inverted index) stay consistent with the new content.
-// Old tag associations are dropped automatically when the document is re-saved.
+// updateDocument replaces a document's content and re-clusters it so its
+// categories (and the inverted index) stay consistent with the new content.
 func (h *Handler) updateDocument(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	doc, ok := h.store.GetDocument(id)
@@ -133,19 +103,20 @@ func (h *Handler) updateDocument(w http.ResponseWriter, r *http.Request) {
 	}
 
 	doc.Content = req.Content
-	doc, err := h.tagger.TagByLLM(r.Context(), doc)
+	doc, err := h.categorizer.Process(r.Context(), doc)
 	if err != nil {
 		log.Printf("handler: updating doc %s: %v", id, err)
-		jsonError(w, "tagging failed: "+err.Error(), http.StatusInternalServerError)
+		jsonError(w, "categorization failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-
 	jsonResponse(w, doc, http.StatusOK)
 }
 
+// deleteDocument removes a document and detaches it from its categories
+// (pruning any left empty) via the categorizer, which owns the centroid math.
 func (h *Handler) deleteDocument(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
-	if _, ok := h.store.DeleteDocument(id); !ok {
+	if _, ok := h.categorizer.Remove(id); !ok {
 		jsonError(w, "document not found", http.StatusNotFound)
 		return
 	}
@@ -173,56 +144,42 @@ func (h *Handler) listDocuments(w http.ResponseWriter, r *http.Request) {
 	}, http.StatusOK)
 }
 
-func (h *Handler) listTags(w http.ResponseWriter, r *http.Request) {
-	tags := h.store.ListTags()
-	type tagSummary struct {
-		Name        string    `json:"name"`
-		DocCount    int       `json:"doc_count"`
-		HasVector   bool      `json:"has_vector"`
-		Description string    `json:"description,omitempty"`
-		CreatedAt   time.Time `json:"created_at"`
+func (h *Handler) listCategories(w http.ResponseWriter, r *http.Request) {
+	cats := h.store.ListCategories()
+	type categorySummary struct {
+		Name      string    `json:"name"`
+		DocCount  int       `json:"doc_count"`
+		CreatedAt time.Time `json:"created_at"`
 	}
-	summaries := make([]tagSummary, len(tags))
-	for i, t := range tags {
-		summaries[i] = tagSummary{
-			Name:        t.Name,
-			DocCount:    h.store.DocCountByTag(t.Name),
-			HasVector:   len(t.Vector) > 0,
-			Description: t.Description,
-			CreatedAt:   t.CreatedAt,
+	summaries := make([]categorySummary, len(cats))
+	for i, c := range cats {
+		summaries[i] = categorySummary{
+			Name:      c.Name,
+			DocCount:  h.store.DocCountByCategory(c.Name),
+			CreatedAt: c.CreatedAt,
 		}
 	}
 	jsonResponse(w, summaries, http.StatusOK)
 }
 
-func (h *Handler) getTag(w http.ResponseWriter, r *http.Request) {
+func (h *Handler) getCategory(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
-	tag, ok := h.store.GetTag(name)
+	c, ok := h.store.GetCategory(name)
 	if !ok {
-		jsonError(w, "tag not found", http.StatusNotFound)
+		jsonError(w, "category not found", http.StatusNotFound)
 		return
 	}
-	type tagDetail struct {
-		Name        string    `json:"name"`
-		Description string    `json:"description"`
-		DocCount    int       `json:"doc_count"`
-		HasVector   bool      `json:"has_vector"`
-		VectorDims  int       `json:"vector_dims"`
-		Examples    []string  `json:"examples"`
-		CreatedAt   time.Time `json:"created_at"`
+	type categoryDetail struct {
+		Name       string    `json:"name"`
+		DocCount   int       `json:"doc_count"`
+		VectorDims int       `json:"vector_dims"`
+		CreatedAt  time.Time `json:"created_at"`
 	}
-	examples := tag.Examples
-	if examples == nil {
-		examples = []string{}
-	}
-	jsonResponse(w, tagDetail{
-		Name:        tag.Name,
-		Description: tag.Description,
-		DocCount:    h.store.DocCountByTag(name),
-		HasVector:   len(tag.Vector) > 0,
-		VectorDims:  len(tag.Vector),
-		Examples:    examples,
-		CreatedAt:   tag.CreatedAt,
+	jsonResponse(w, categoryDetail{
+		Name:       c.Name,
+		DocCount:   h.store.DocCountByCategory(name),
+		VectorDims: len(c.Centroid),
+		CreatedAt:  c.CreatedAt,
 	}, http.StatusOK)
 }
 
@@ -248,9 +205,9 @@ func (h *Handler) search(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) health(w http.ResponseWriter, r *http.Request) {
 	jsonResponse(w, map[string]any{
-		"status":    "ok",
-		"doc_count": h.store.DocCount(),
-		"tag_count": h.store.TagCount(),
+		"status":         "ok",
+		"doc_count":      h.store.DocCount(),
+		"category_count": h.store.CategoryCount(),
 	}, http.StatusOK)
 }
 

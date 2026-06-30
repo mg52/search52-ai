@@ -1,4 +1,0 @@
-Existing tags: {{.ExistingTags}}
-Document: {{.Content}}
-
-Reply with ONLY: {"tags": ["tag1", "tag2"]}

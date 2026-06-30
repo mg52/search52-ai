@@ -13,151 +13,108 @@ import (
 type Engine struct {
 	embedding *ai.EmbeddingClient
 	store     store.Store
-	threshold float64
+	topN      int // number of nearest categories to scan
 }
 
-func NewEngine(embedding *ai.EmbeddingClient, st store.Store, threshold float64) *Engine {
-	return &Engine{
-		embedding: embedding,
-		store:     st,
-		threshold: threshold,
+func NewEngine(embedding *ai.EmbeddingClient, st store.Store, topN int) *Engine {
+	if topN <= 0 {
+		topN = 3
 	}
+	return &Engine{embedding: embedding, store: st, topN: topN}
 }
 
 type Query struct {
-	Q            string  `json:"q"`
-	Limit        int     `json:"limit"`
-	VectorWeight float64 `json:"vector_weight"`
-	TagWeight    float64 `json:"tag_weight"`
+	Q     string `json:"q"`
+	Limit int    `json:"limit"`
 }
 
-// TagMatch is a single tag the query matched, with its similarity to the query.
-type TagMatch struct {
-	Tag   string  `json:"tag"`
-	Score float64 `json:"score"`
-}
-
-// Results is the search response: the ranked documents plus the query-level
-// list of which tags the query matched (independent of any document).
+// Results is the search response: the ranked documents plus the categories the
+// query matched (independent of any single document).
 type Results struct {
-	Documents   []store.SearchResult `json:"documents"`
-	MatchedTags []TagMatch           `json:"matched_tags"`
+	Documents         []store.SearchResult  `json:"documents"`
+	MatchedCategories []store.CategoryMatch `json:"matched_categories"`
 }
 
+// Search embeds the query, finds the nearest categories, and ranks their member
+// documents by cosine similarity of the query to each document's vector.
 func (e *Engine) Search(ctx context.Context, q Query) (Results, error) {
 	if q.Limit <= 0 {
 		q.Limit = 10
 	}
-	if q.VectorWeight == 0 && q.TagWeight == 0 {
-		q.VectorWeight = 0.6
-		q.TagWeight = 0.4
-	}
-
-	empty := Results{Documents: []store.SearchResult{}, MatchedTags: []TagMatch{}}
+	empty := Results{Documents: []store.SearchResult{}, MatchedCategories: []store.CategoryMatch{}}
 
 	queryVec, err := e.embedding.Embed(ctx, q.Q)
 	if err != nil {
 		return Results{}, fmt.Errorf("embedding query: %w", err)
 	}
-
 	queryNorm := vec.Norm(queryVec)
 	if queryNorm == 0 {
 		return empty, nil
 	}
 
-	allTags := e.store.ListTags()
+	candidates, matched := e.candidates(queryVec, queryNorm)
+	if matched == nil {
+		matched = []store.CategoryMatch{}
+	}
+	if len(candidates) == 0 {
+		return Results{Documents: []store.SearchResult{}, MatchedCategories: matched}, nil
+	}
 
-	// tag name to similarity float
-	matchedTagSimilarity := make(map[string]float64)
-
-	for _, tag := range allTags {
-		if tag.Norm == 0 {
-			continue // tag has no embedding yet
+	results := make([]store.SearchResult, 0, len(candidates))
+	for _, doc := range candidates {
+		if doc.Norm == 0 {
+			continue
 		}
-		sim := vec.Cosine(queryVec, tag.Vector, queryNorm, tag.Norm)
-		if sim >= e.threshold {
-			matchedTagSimilarity[tag.Name] = sim
+		sim := vec.Cosine(queryVec, doc.Vector, queryNorm, doc.Norm)
+		if sim <= 0 {
+			continue // irrelevant to the query
 		}
+		results = append(results, store.SearchResult{
+			Document:   doc,
+			Score:      sim,
+			Categories: doc.Categories,
+		})
 	}
 
-	if len(matchedTagSimilarity) == 0 {
-		return empty, nil
+	sort.Slice(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+	if len(results) > q.Limit {
+		results = results[:q.Limit]
 	}
 
-	// The query-level matched tags, sorted by similarity (most relevant first).
-	// This sits alongside the documents, independent of which docs matched.
-	matchedTags := make([]TagMatch, 0, len(matchedTagSimilarity))
-	for name, sim := range matchedTagSimilarity {
-		matchedTags = append(matchedTags, TagMatch{Tag: name, Score: sim})
-	}
-	sort.Slice(matchedTags, func(i, j int) bool {
-		return matchedTags[i].Score > matchedTags[j].Score
-	})
+	return Results{Documents: results, MatchedCategories: matched}, nil
+}
 
-	// Accumulate one hit per document: which query tags matched it, and the
-	// strongest of those tag similarities. maxSim is only final once every tag
-	// is processed, so ranking happens in a second pass below.
-	type hit struct {
-		doc     store.Document
-		matched []string
-		maxSim  float64
-		score   float64
+// candidates ranks every category by cosine similarity of its centroid to the
+// query, takes the topN nearest, and returns their deduped member documents
+// along with the matched categories. The store only hands back stored data; the
+// similarity ranking is the search layer's business.
+func (e *Engine) candidates(queryVec []float64, queryNorm float64) ([]store.Document, []store.CategoryMatch) {
+	cats := e.store.ListCategories()
+	matches := make([]store.CategoryMatch, 0, len(cats))
+	for _, c := range cats {
+		if c.Norm == 0 {
+			continue
+		}
+		matches = append(matches, store.CategoryMatch{Name: c.Name, Score: vec.Cosine(queryVec, c.Centroid, queryNorm, c.Norm)})
 	}
-	acc := make(map[string]*hit)
-	for tagName, sim := range matchedTagSimilarity {
-		for _, id := range e.store.GetDocIDsByTag(tagName) {
-			h := acc[id]
-			if h == nil {
-				doc, ok := e.store.GetDocument(id)
-				if !ok {
-					continue
-				}
-				h = &hit{doc: doc}
-				acc[id] = h
+	if len(matches) == 0 {
+		return nil, nil
+	}
+	sort.Slice(matches, func(i, j int) bool { return matches[i].Score > matches[j].Score })
+	if e.topN < len(matches) {
+		matches = matches[:e.topN]
+	}
+
+	seen := make(map[string]struct{})
+	var docs []store.Document
+	for _, m := range matches {
+		for _, doc := range e.store.DocsInCategory(m.Name) {
+			if _, dup := seen[doc.ID]; dup {
+				continue
 			}
-			h.matched = append(h.matched, tagName)
-			if sim > h.maxSim {
-				h.maxSim = sim
-			}
+			seen[doc.ID] = struct{}{}
+			docs = append(docs, doc)
 		}
 	}
-
-	// Rank with a single equation that folds together how strongly the document
-	// matched (maxSim) and how many query tags it shares (tagMatchScore), tuned by
-	// q.VectorWeight / q.TagWeight. The score is quantized into an integer bucket
-	// so that walking buckets top-down replaces the O(n log n) comparison sort with
-	// an O(n + range) bucket sort, and still stops as soon as q.Limit is reached.
-	const bucketScale = 100
-	maxBucket := 0
-	buckets := make(map[int][]*hit)
-	for _, h := range acc {
-		var tagMatchScore float64
-		if len(h.doc.Tags) > 0 {
-			tagMatchScore = float64(len(h.matched)) / float64(len(h.doc.Tags))
-			// tagMatchScore = float64(len(h.matched))
-		}
-		h.score = (h.maxSim * q.VectorWeight) + (tagMatchScore * q.TagWeight)
-
-		b := int(h.score * bucketScale)
-		buckets[b] = append(buckets[b], h)
-		if b > maxBucket {
-			maxBucket = b
-		}
-	}
-
-	results := make([]store.SearchResult, 0, min(q.Limit, len(acc)))
-	for b := maxBucket; b >= 0; b-- {
-		for _, h := range buckets[b] {
-			results = append(results, store.SearchResult{
-				Document:    h.doc,
-				Score:       h.score,
-				MatchedTags: h.matched,
-			})
-			if len(results) >= q.Limit {
-				return Results{Documents: results, MatchedTags: matchedTags}, nil
-			}
-		}
-	}
-
-	return Results{Documents: results, MatchedTags: matchedTags}, nil
+	return docs, matches
 }

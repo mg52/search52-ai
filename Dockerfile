@@ -23,16 +23,14 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
 
 # ---------- runtime stage ----------
 # distroless/static:nonroot ships CA certificates (needed for outbound HTTPS to
-# the LLM/embedding APIs), runs as an unprivileged user, and has no shell or
+# the embedding API), runs as an unprivileged user, and has no shell or
 # package manager to attack.
 FROM gcr.io/distroless/static:nonroot
 WORKDIR /app
 
 COPY --from=build /out/server /app/server
-COPY --from=build /src/prompts /app/prompts
 
-ENV PORT=8080 \
-    PROMPTS_DIR=/app/prompts
+ENV PORT=8080
 
 EXPOSE 8080
 USER nonroot:nonroot

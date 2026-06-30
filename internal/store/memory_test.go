@@ -1,207 +1,126 @@
 package store
 
-import (
-	"testing"
-	"time"
-)
+import "testing"
 
-func doc(id string, tags ...string) Document {
-	return Document{ID: id, Content: "content of " + id, Tags: tags}
+func doc(id string, cats ...string) Document {
+	return Document{ID: id, Content: "content of " + id, Categories: cats}
 }
 
-func TestSaveAndGetDocument(t *testing.T) {
+func TestPutGetDeleteDocument(t *testing.T) {
 	s := NewMemoryStore()
-	if err := s.SaveDocument(doc("d1", "a")); err != nil {
-		t.Fatalf("SaveDocument: %v", err)
-	}
-	got, ok := s.GetDocument("d1")
-	if !ok {
-		t.Fatal("GetDocument: not found")
-	}
-	if got.ID != "d1" || got.CreatedAt.IsZero() {
-		t.Errorf("unexpected doc: %+v", got)
-	}
-	if _, ok := s.GetDocument("missing"); ok {
-		t.Error("expected missing doc to return false")
-	}
-}
-
-func TestSaveDocumentPreservesCreatedAt(t *testing.T) {
-	s := NewMemoryStore()
-	ts := time.Date(2020, 1, 1, 0, 0, 0, 0, time.UTC)
-	d := doc("d1", "a")
-	d.CreatedAt = ts
-	s.SaveDocument(d)
-	got, _ := s.GetDocument("d1")
-	if !got.CreatedAt.Equal(ts) {
-		t.Errorf("CreatedAt overwritten: got %v", got.CreatedAt)
-	}
-}
-
-func TestInvertedIndex(t *testing.T) {
-	s := NewMemoryStore()
-	s.SaveDocument(doc("d1", "a", "b"))
-	s.SaveDocument(doc("d2", "a"))
-
-	if got := s.DocCountByTag("a"); got != 2 {
-		t.Errorf("DocCountByTag(a) = %d, want 2", got)
-	}
-	if got := s.DocCountByTag("b"); got != 1 {
-		t.Errorf("DocCountByTag(b) = %d, want 1", got)
-	}
-	if got := s.DocCountByTag("missing"); got != 0 {
-		t.Errorf("DocCountByTag(missing) = %d, want 0", got)
-	}
-
-	docs := s.GetDocumentsByTag("a")
-	if len(docs) != 2 {
-		t.Fatalf("GetDocumentsByTag(a) = %d docs, want 2", len(docs))
-	}
-	ids := s.GetDocIDsByTag("a")
-	if len(ids) != 2 {
-		t.Fatalf("GetDocIDsByTag(a) = %d ids, want 2", len(ids))
-	}
-	seen := map[string]bool{}
-	for _, id := range ids {
-		seen[id] = true
-	}
-	if !seen["d1"] || !seen["d2"] {
-		t.Errorf("GetDocIDsByTag(a) = %v, want d1 and d2", ids)
-	}
-}
-
-func TestDuplicateTagsDeduped(t *testing.T) {
-	s := NewMemoryStore()
-	s.SaveDocument(doc("d1", "a", "a", "a"))
-	if got := s.DocCountByTag("a"); got != 1 {
-		t.Errorf("DocCountByTag(a) = %d, want 1 (deduped)", got)
-	}
-	if got := s.GetDocIDsByTag("a"); len(got) != 1 {
-		t.Errorf("GetDocIDsByTag(a) = %v, want single id", got)
-	}
-}
-
-func TestResaveUpdatesIndex(t *testing.T) {
-	s := NewMemoryStore()
-	s.SaveDocument(doc("d1", "a", "b"))
-	// Re-save the same ID with a different tag set.
-	s.SaveDocument(doc("d1", "b", "c"))
-
-	if got := s.DocCountByTag("a"); got != 0 {
-		t.Errorf("stale tag a still present: count %d", got)
-	}
-	if got := s.GetDocIDsByTag("a"); len(got) != 0 {
-		t.Errorf("stale tag a posting list: %v", got)
-	}
-	if got := s.DocCountByTag("b"); got != 1 {
-		t.Errorf("DocCountByTag(b) = %d, want 1", got)
-	}
-	if got := s.DocCountByTag("c"); got != 1 {
-		t.Errorf("DocCountByTag(c) = %d, want 1", got)
-	}
-	// Re-save must not create duplicates in the index.
-	if got := s.GetDocIDsByTag("b"); len(got) != 1 {
-		t.Errorf("GetDocIDsByTag(b) = %v, want single id", got)
-	}
-}
-
-func TestDeleteDocument(t *testing.T) {
-	s := NewMemoryStore()
-	s.SaveDocument(doc("d1", "a", "b"))
-	s.SaveDocument(doc("d2", "a"))
-
-	deleted, ok := s.DeleteDocument("d1")
-	if !ok {
-		t.Fatal("DeleteDocument: expected ok")
-	}
-	if deleted.ID != "d1" {
-		t.Errorf("returned doc = %s, want d1", deleted.ID)
-	}
-	if _, ok := s.GetDocument("d1"); ok {
-		t.Error("d1 still retrievable after delete")
-	}
-	// Tag b had only d1 -> gone; tag a had d1,d2 -> now only d2.
-	if got := s.DocCountByTag("b"); got != 0 {
-		t.Errorf("DocCountByTag(b) = %d, want 0", got)
-	}
-	if got := s.DocCountByTag("a"); got != 1 {
-		t.Errorf("DocCountByTag(a) = %d, want 1", got)
-	}
-	// docList kept consistent: total reflects remaining docs.
-	_, total := s.ListDocuments(1, 10)
-	if total != 1 {
-		t.Errorf("total after delete = %d, want 1", total)
+	s.PutDocument(doc("d1"))
+	if _, ok := s.GetDocument("d1"); !ok {
+		t.Fatal("d1 not found after put")
 	}
 	if s.DocCount() != 1 {
-		t.Errorf("DocCount = %d, want 1", s.DocCount())
+		t.Fatalf("doc count = %d, want 1", s.DocCount())
 	}
 
-	if _, ok := s.DeleteDocument("missing"); ok {
-		t.Error("deleting missing doc should return false")
+	// Re-putting the same ID replaces, not duplicates.
+	s.PutDocument(Document{ID: "d1", Content: "changed"})
+	if got, _ := s.GetDocument("d1"); got.Content != "changed" {
+		t.Fatalf("content = %q, want changed", got.Content)
+	}
+	if s.DocCount() != 1 {
+		t.Fatalf("doc count after replace = %d, want 1", s.DocCount())
+	}
+
+	if !s.DeleteDocument("d1") {
+		t.Fatal("delete returned false")
+	}
+	if s.DeleteDocument("d1") {
+		t.Fatal("second delete should return false")
+	}
+	if s.DocCount() != 0 {
+		t.Fatalf("doc count after delete = %d, want 0", s.DocCount())
 	}
 }
 
 func TestListDocumentsPagination(t *testing.T) {
 	s := NewMemoryStore()
 	for _, id := range []string{"d1", "d2", "d3", "d4", "d5"} {
-		s.SaveDocument(doc(id, "a"))
+		s.PutDocument(doc(id))
 	}
 	page1, total := s.ListDocuments(1, 2)
-	if total != 5 {
-		t.Errorf("total = %d, want 5", total)
+	if total != 5 || len(page1) != 2 {
+		t.Fatalf("page1 len=%d total=%d, want 2/5", len(page1), total)
 	}
-	if len(page1) != 2 {
-		t.Errorf("page1 len = %d, want 2", len(page1))
+	// Insertion order is preserved.
+	if page1[0].ID != "d1" || page1[1].ID != "d2" {
+		t.Fatalf("page1 = %v, want d1,d2", []string{page1[0].ID, page1[1].ID})
 	}
 	page3, _ := s.ListDocuments(3, 2)
 	if len(page3) != 1 {
-		t.Errorf("page3 len = %d, want 1", len(page3))
+		t.Fatalf("page3 len = %d, want 1", len(page3))
 	}
-	// Out-of-range page returns nil docs but correct total.
-	pageX, total := s.ListDocuments(99, 2)
-	if pageX != nil || total != 5 {
-		t.Errorf("out-of-range page = %v total %d", pageX, total)
+	if pageX, total := s.ListDocuments(99, 2); pageX != nil || total != 5 {
+		t.Fatalf("out-of-range page = %v total %d", pageX, total)
 	}
 }
 
-func TestTagCRUD(t *testing.T) {
+func TestPutGetDeleteCategory(t *testing.T) {
 	s := NewMemoryStore()
-	if err := s.SaveTag(Tag{Name: "a"}); err != nil {
-		t.Fatalf("SaveTag: %v", err)
+	s.PutCategory(Category{Name: "category1", Centroid: []float64{1, 0}, Norm: 1, Count: 1})
+	c, ok := s.GetCategory("category1")
+	if !ok || c.Count != 1 || len(c.Centroid) != 2 {
+		t.Fatalf("category1 = %+v ok=%v", c, ok)
 	}
-	got, ok := s.GetTag("a")
-	if !ok || got.CreatedAt.IsZero() {
-		t.Errorf("GetTag(a) = %+v, ok=%v", got, ok)
-	}
-	if _, ok := s.GetTag("missing"); ok {
-		t.Error("expected missing tag false")
+	if s.CategoryCount() != 1 {
+		t.Fatalf("category count = %d, want 1", s.CategoryCount())
 	}
 
-	got.Description = "updated"
-	if err := s.UpdateTag(got); err != nil {
-		t.Fatalf("UpdateTag: %v", err)
+	s.AddDocToCategory("d1", "category1")
+	s.DeleteCategory("category1")
+	if _, ok := s.GetCategory("category1"); ok {
+		t.Fatal("category1 still present after delete")
 	}
-	reread, _ := s.GetTag("a")
-	if reread.Description != "updated" {
-		t.Errorf("description = %q, want updated", reread.Description)
-	}
-
-	if err := s.UpdateTag(Tag{Name: "ghost"}); err == nil {
-		t.Error("UpdateTag of missing tag should error")
+	// DeleteCategory also clears the index.
+	if s.DocCountByCategory("category1") != 0 {
+		t.Fatalf("index not cleared on category delete: %d", s.DocCountByCategory("category1"))
 	}
 }
 
-func TestListTagsAndNames(t *testing.T) {
+func TestListCategoriesSorted(t *testing.T) {
 	s := NewMemoryStore()
-	s.SaveTag(Tag{Name: "a"})
-	s.SaveTag(Tag{Name: "b"})
-	if got := s.ListTags(); len(got) != 2 {
-		t.Errorf("ListTags len = %d, want 2", len(got))
+	for _, n := range []string{"category3", "category1", "category2"} {
+		s.PutCategory(Category{Name: n})
 	}
-	if got := s.GetTagNames(); len(got) != 2 {
-		t.Errorf("GetTagNames len = %d, want 2", len(got))
+	cats := s.ListCategories()
+	if len(cats) != 3 || cats[0].Name != "category1" || cats[2].Name != "category3" {
+		t.Fatalf("ListCategories not sorted: %v", cats)
 	}
-	if got := s.TagCount(); got != 2 {
-		t.Errorf("TagCount = %d, want 2", got)
+}
+
+func TestCategoryIndex(t *testing.T) {
+	s := NewMemoryStore()
+	s.PutDocument(doc("d1"))
+	s.PutDocument(doc("d2"))
+	s.AddDocToCategory("d1", "category1")
+	s.AddDocToCategory("d2", "category1")
+	s.AddDocToCategory("d1", "category1") // idempotent
+
+	if got := s.DocCountByCategory("category1"); got != 2 {
+		t.Fatalf("doc count by category = %d, want 2", got)
+	}
+	docs := s.DocsInCategory("category1")
+	if len(docs) != 2 {
+		t.Fatalf("DocsInCategory len = %d, want 2", len(docs))
+	}
+
+	// DeleteDocument does NOT touch the index, so the membership lingers but
+	// DocsInCategory skips the now-missing document.
+	s.DeleteDocument("d1")
+	if got := len(s.DocsInCategory("category1")); got != 1 {
+		t.Fatalf("DocsInCategory after doc delete = %d, want 1", got)
+	}
+	if got := s.DocCountByCategory("category1"); got != 2 {
+		t.Fatalf("index unchanged by DeleteDocument = %d, want 2", got)
+	}
+
+	// Explicit membership removal is what shrinks the index.
+	s.RemoveDocFromCategory("d1", "category1")
+	s.RemoveDocFromCategory("d2", "category1")
+	if got := s.DocCountByCategory("category1"); got != 0 {
+		t.Fatalf("doc count after remove = %d, want 0", got)
 	}
 }

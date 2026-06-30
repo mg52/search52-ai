@@ -1,5 +1,0 @@
-Tag: {{.TagName}}
-Example documents:
-{{.Examples}}
-
-Reply with ONLY: {"description": "..."}
