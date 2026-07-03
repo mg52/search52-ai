@@ -11,8 +11,9 @@ type Config struct {
 	EmbeddingAPIKey  string
 	EmbeddingModel   string
 	Port             string
+	DataDir          string // where per-index snapshots live
 
-	// Categorization / search tuning.
+	// Default categorization / search tuning for new indexes.
 	CategoryThreshold   float64 // min cosine to join an existing category
 	MaxCategoriesPerDoc int     // cap on categories one document may join
 	MaxCategories       int     // cap on total categories
@@ -23,25 +24,24 @@ func Load() (*Config, error) {
 	c := &Config{}
 
 	var missing []string
-	// getRequired := func(key string) string {
-	// 	v := os.Getenv(key)
-	// 	if v == "" {
-	// 		missing = append(missing, key)
-	// 	}
-	// 	return v
-	// }
+	getRequired := func(key string) string {
+		v := os.Getenv(key)
+		if v == "" {
+			missing = append(missing, key)
+		}
+		return v
+	}
 
-	// c.EmbeddingBaseURL = getRequired("EMBEDDING_BASE_URL")
-	c.EmbeddingBaseURL = "http://localhost:11434/v1"
+	c.EmbeddingBaseURL = getRequired("EMBEDDING_BASE_URL")
 	c.EmbeddingAPIKey = os.Getenv("EMBEDDING_API_KEY") // optional (e.g. local Ollama)
-	// c.EmbeddingModel = getRequired("EMBEDDING_MODEL")
-	c.EmbeddingModel = "nomic-embed-text"
+	c.EmbeddingModel = getRequired("EMBEDDING_MODEL")
 
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("missing required environment variables: %v", missing)
 	}
 
 	c.Port = getEnvDefault("PORT", "8080")
+	c.DataDir = getEnvDefault("DATA_DIR", "./data")
 
 	var err error
 	if c.CategoryThreshold, err = parseFloat("CATEGORY_THRESHOLD", "0.60"); err != nil {

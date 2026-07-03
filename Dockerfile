@@ -21,6 +21,11 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux GOFLAGS=-trimpath \
     go build -ldflags "-s -w" -o /out/server ./cmd/server
 
+# Pre-create the data dir owned by the nonroot uid (65532). distroless has no
+# shell, so it cannot mkdir at runtime; and a bind/volume mounted over /data
+# would otherwise be root-owned and unwritable by the nonroot user.
+RUN mkdir -p /data
+
 # ---------- runtime stage ----------
 # distroless/static:nonroot ships CA certificates (needed for outbound HTTPS to
 # the embedding API), runs as an unprivileged user, and has no shell or
@@ -29,8 +34,13 @@ FROM gcr.io/distroless/static:nonroot
 WORKDIR /app
 
 COPY --from=build /out/server /app/server
+COPY --from=build --chown=65532:65532 /data /data
 
-ENV PORT=8080
+# Per-index snapshots are written under DATA_DIR; mount a volume here to persist
+# indexes across container restarts.
+ENV PORT=8080 \
+    DATA_DIR=/data
+VOLUME ["/data"]
 
 EXPOSE 8080
 USER nonroot:nonroot

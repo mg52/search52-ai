@@ -37,13 +37,14 @@ type embeddingRequest struct {
 
 type embeddingResponse struct {
 	Data []struct {
-		Embedding []float64 `json:"embedding"`
+		Embedding []float32 `json:"embedding"`
 	} `json:"data"`
 }
 
 // Embed returns the embedding vector for text, retrying transient failures with
-// exponential backoff.
-func (c *EmbeddingClient) Embed(ctx context.Context, text string) ([]float64, error) {
+// exponential backoff. Vectors are float32 end-to-end: embedding similarities
+// don't need float64 precision and the smaller footprint halves scan bandwidth.
+func (c *EmbeddingClient) Embed(ctx context.Context, text string) ([]float32, error) {
 	req := embeddingRequest{Input: text, Model: c.model}
 	var resp embeddingResponse
 	err := retry(ctx, 3, func() error {

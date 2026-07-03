@@ -5,9 +5,16 @@ by vector similarity and retrieves them via embedding search. No LLM is involved
 only an embedding model. Compatible with any OpenAI-compatible embeddings API
 (Ollama, OpenAI, etc.).
 
+Documents live in named **indexes**. Each index is an independent, self-contained
+engine with its own documents, categories, and tuning; you can create many of
+them under one server (e.g. `products`, `tickets`, `docs`). Every index is
+snapshotted to disk under `DATA_DIR` and reloaded on startup, so data survives
+restarts.
+
 ## How it works
 
-Documents are indexed through a single embedding pipeline (`POST /documents`):
+Documents are indexed through a single embedding pipeline
+(`POST /indexes/{index}/documents`):
 
 **Embed** — the document content is embedded once into a dense vector.
 
@@ -20,9 +27,10 @@ to its single nearest category so everything stays categorized. Each category's
 centroid is the running mean of its members and is updated on every add/remove,
 so categories drift to track their contents.
 
-**Search** (`POST /search`) — the query is embedded, the `TOP_N_CATEGORIES`
-nearest category centroids are selected, and their member documents are ranked by
-cosine similarity of the query to each document's own vector:
+**Search** (`POST /indexes/{index}/search`) — the query is embedded, the
+`TOP_N_CATEGORIES` nearest category centroids are selected, and their member
+documents are ranked by cosine similarity of the query to each document's own
+vector:
 
 ```
 score = cosine(query_vector, document_vector)
@@ -40,8 +48,12 @@ Requires an OpenAI-compatible embedding endpoint (e.g. Ollama). No LLM needed.
 EMBEDDING_BASE_URL=http://localhost:11434/v1 \
 EMBEDDING_API_KEY=ollama \
 EMBEDDING_MODEL=nomic-embed-text \
+DATA_DIR=./data \
 go run ./cmd/server
 ```
+
+Indexes are persisted as one snapshot per index under `DATA_DIR` (default
+`./data`) and reloaded on startup.
 
 ## Docker
 
@@ -55,11 +67,14 @@ docker run --rm -p 8080:8080 \
   -e EMBEDDING_BASE_URL=http://host.docker.internal:11434/v1 \
   -e EMBEDDING_API_KEY=ollama \
   -e EMBEDDING_MODEL=nomic-embed-text \
+  -v search52-data:/data \
   search52-ai
 ```
 
-The container exposes `8080`; point your orchestrator's liveness/readiness probe
-at `GET /health`.
+The image declares `DATA_DIR=/data` and a `VOLUME` at `/data` (writable by the
+non-root user); mount a named volume or host path there to persist indexes across
+restarts. The container exposes `8080`; point your orchestrator's liveness/
+readiness probe at `GET /health`.
 
 ## Configuration
 
@@ -69,35 +84,53 @@ at `GET /health`.
 | `EMBEDDING_MODEL`        | required  | Embedding model name                                 |
 | `EMBEDDING_API_KEY`      | optional  | API key (`ollama` locally; omit if unauthenticated)  |
 | `PORT`                   | `8080`    | HTTP port                                            |
+| `DATA_DIR`               | `./data`  | Directory holding one snapshot subdir per index      |
 | `CATEGORY_THRESHOLD`     | `0.60`    | Min cosine similarity to join an existing category   |
 | `MAX_CATEGORIES_PER_DOC` | `3`       | Max categories a single document may join            |
 | `MAX_CATEGORIES`         | `100`     | Cap on the total number of categories                |
 | `TOP_N_CATEGORIES`       | `3`       | Nearest categories scanned per query                 |
 
+The four tuning variables set the **defaults** applied to new indexes. Any of
+them can be overridden per index in the `POST /indexes` request body.
+
 ## API
 
-| Method | Path                  | Description                                          |
-|--------|-----------------------|------------------------------------------------------|
-| POST   | `/documents`          | Embed and categorize a document                      |
-| GET    | `/documents`          | List documents (`?page=1&size=20`)                   |
-| GET    | `/documents/{id}`     | Get a single document                                |
-| PUT    | `/documents/{id}`     | Replace a document's content and re-categorize it    |
-| DELETE | `/documents/{id}`     | Delete a document and its category memberships       |
-| GET    | `/categories`         | List all categories with document counts             |
-| GET    | `/categories/{name}`  | Get category detail                                  |
-| POST   | `/search`             | Semantic search                                      |
-| GET    | `/health`             | Service status                                       |
+All document, category, and search operations are scoped to an index at
+`/indexes/{index}/…`.
 
-**Index a document**
+| Method | Path                                   | Description                                       |
+|--------|----------------------------------------|---------------------------------------------------|
+| POST   | `/indexes`                             | Create an index (optional per-index tuning)       |
+| GET    | `/indexes`                             | List indexes with document/category counts        |
+| DELETE | `/indexes/{index}`                     | Delete an index and its on-disk snapshot          |
+| POST   | `/indexes/{index}/documents`           | Embed and categorize a document                   |
+| GET    | `/indexes/{index}/documents/{id}`      | Get a single document                             |
+| PUT    | `/indexes/{index}/documents/{id}`      | Replace a document's content and re-categorize it |
+| DELETE | `/indexes/{index}/documents/{id}`      | Delete a document and its category memberships    |
+| GET    | `/indexes/{index}/categories`          | List all categories with document counts          |
+| GET    | `/indexes/{index}/categories/{name}`   | Get category detail                               |
+| POST   | `/indexes/{index}/search`              | Semantic search                                   |
+| GET    | `/health`                              | Service status (index count)                      |
+
+Index names must match `^[A-Za-z0-9_.-]{1,128}$`.
+
+**Create an index** (tuning fields are optional; omit to inherit server defaults)
 ```bash
-curl -X POST http://localhost:8080/documents \
+curl -X POST http://localhost:8080/indexes \
+  -H "Content-Type: application/json" \
+  -d '{"name": "products", "category_threshold": 0.6, "max_categories_per_doc": 3, "max_categories": 100, "top_n_categories": 3}'
+```
+
+**Index a document** (`id` is optional; a timestamp id is generated when omitted)
+```bash
+curl -X POST http://localhost:8080/indexes/products/documents \
   -H "Content-Type: application/json" \
   -d '{"id": "doc1", "content": "Sony WH-1000XM5 Wireless Noise Cancelling Headphones..."}'
 ```
 
 **Search**
 ```bash
-curl -X POST http://localhost:8080/search \
+curl -X POST http://localhost:8080/indexes/products/search \
   -H "Content-Type: application/json" \
   -d '{"q": "wireless noise cancelling audio", "limit": 5}'
 ```
@@ -121,25 +154,32 @@ Response:
 ## Architecture
 
 ```
-POST /documents
+Manager
+  └── indexes[name] → SearchEngine (docs + categories, one RWMutex)
+        └── persisted to DATA_DIR/<name>/index.gob (gzip'd), reloaded on startup
+
+POST /indexes/{index}/documents
   └── embed(content) → cosine vs category centroids
         ├── ≥ threshold → join nearest categories (≤ MAX_CATEGORIES_PER_DOC)
         └── otherwise   → new category (or nearest, if MAX_CATEGORIES reached)
               └── update category centroid (running mean)
 
-POST /search
+POST /indexes/{index}/search
   └── embed(query) → TOP_N_CATEGORIES nearest centroids
         └── member docs ranked by cosine(query, doc_vector)
               └── returns { documents, matched_categories }
 ```
 
-The store is in-memory; all data is lost on restart.
+Each index is held in memory for serving and snapshotted to disk after every
+mutation (a gzip-compressed gob written via a temp file + atomic rename). On
+startup every snapshot under `DATA_DIR` is loaded back into memory.
 
 ## TODO
 
-- **Persistent storage** — swap the in-memory store for SQLite/PostgreSQL (+ pgvector for centroids and document vectors)
+- **Incremental persistence** — replace the whole-index snapshot with a write-ahead log + periodic compaction so writes don't rewrite the full index
+- **External storage** — optional SQLite/PostgreSQL backend (+ pgvector for centroids and document vectors)
 - **Category merging** — detect and merge categories whose centroids drift close together over time
 - **Recall tuning** — expose per-query `top_n` override; consider scanning more categories when the nearest are weak
-- **Bulk ingestion** — `POST /documents/batch` with concurrent embedding and back-pressure
+- **Bulk ingestion** — `POST /indexes/{index}/documents/batch` with concurrent embedding and back-pressure
 - **Search filters** — filter results by category, date range, or minimum score
 ```
