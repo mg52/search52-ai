@@ -104,6 +104,7 @@ All document, category, and search operations are scoped to an index at
 | GET    | `/indexes`                             | List indexes with document/category counts        |
 | DELETE | `/indexes/{index}`                     | Delete an index and its on-disk snapshot          |
 | POST   | `/indexes/{index}/documents`           | Embed and categorize a document                   |
+| POST   | `/indexes/{index}/documents/batch`     | Bulk-index many documents, persisting once at end |
 | GET    | `/indexes/{index}/documents/{id}`      | Get a single document                             |
 | PUT    | `/indexes/{index}/documents/{id}`      | Replace a document's content and re-categorize it |
 | DELETE | `/indexes/{index}/documents/{id}`      | Delete a document and its category memberships    |
@@ -126,6 +127,19 @@ curl -X POST http://localhost:8080/indexes \
 curl -X POST http://localhost:8080/indexes/products/documents \
   -H "Content-Type: application/json" \
   -d '{"id": "doc1", "content": "Sony WH-1000XM5 Wireless Noise Cancelling Headphones..."}'
+```
+
+**Bulk-index documents** (embeds each in order, then writes a single snapshot)
+```bash
+curl -X POST http://localhost:8080/indexes/products/documents/batch \
+  -H "Content-Type: application/json" \
+  --data-binary @testdata/sample_documents.json
+```
+`testdata/sample_documents.json` ships 100 sample documents spanning five topics
+(audio, medical, kitchen, gardening, developer tools). The response reports how
+many were indexed and lists any per-document failures:
+```json
+{ "indexed": 100, "failed": 0, "errors": [] }
 ```
 
 **Search**
@@ -177,9 +191,8 @@ startup every snapshot under `DATA_DIR` is loaded back into memory.
 ## TODO
 
 - **Incremental persistence** — replace the whole-index snapshot with a write-ahead log + periodic compaction so writes don't rewrite the full index
-- **External storage** — optional SQLite/PostgreSQL backend (+ pgvector for centroids and document vectors)
 - **Category merging** — detect and merge categories whose centroids drift close together over time
 - **Recall tuning** — expose per-query `top_n` override; consider scanning more categories when the nearest are weak
-- **Bulk ingestion** — `POST /indexes/{index}/documents/batch` with concurrent embedding and back-pressure
+- **Concurrent bulk ingestion** — `POST /indexes/{index}/documents/batch` exists but embeds sequentially; add concurrent embedding with back-pressure
 - **Search filters** — filter results by category, date range, or minimum score
 ```

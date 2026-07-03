@@ -73,6 +73,7 @@ func (m *Manager) Routes() *http.ServeMux {
 	mux.HandleFunc("DELETE /indexes/{index}", m.deleteIndex)
 
 	mux.HandleFunc("POST /indexes/{index}/documents", m.createDocument)
+	mux.HandleFunc("POST /indexes/{index}/documents/batch", m.batchDocuments)
 	mux.HandleFunc("GET /indexes/{index}/documents/{id}", m.getDocument)
 	mux.HandleFunc("PUT /indexes/{index}/documents/{id}", m.updateDocument)
 	mux.HandleFunc("DELETE /indexes/{index}/documents/{id}", m.deleteDocument)
@@ -241,6 +242,69 @@ func (m *Manager) createDocument(w http.ResponseWriter, r *http.Request) {
 	}
 	m.persist(se)
 	jsonResponse(w, doc, http.StatusCreated)
+}
+
+type batchDocumentsReq struct {
+	Documents []documentReq `json:"documents"`
+}
+
+type batchError struct {
+	ID    string `json:"id"`
+	Error string `json:"error"`
+}
+
+// batchDocuments ingests many documents in one request. Every document is
+// embedded and clustered in order, then the index is persisted exactly ONCE at
+// the end — not per document — so a bulk load pays a single snapshot write
+// instead of one per item. Individual failures (empty content, embedding
+// errors) are collected and reported without aborting the rest of the batch.
+// A document whose id already exists is re-processed (its content and category
+// memberships are replaced), so a batch acts as an upsert.
+func (m *Manager) batchDocuments(w http.ResponseWriter, r *http.Request) {
+	se := m.index(w, r)
+	if se == nil {
+		return
+	}
+	var req batchDocumentsReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if len(req.Documents) == 0 {
+		jsonError(w, "documents is required", http.StatusBadRequest)
+		return
+	}
+
+	indexed := 0
+	errs := []batchError{}
+	for i, d := range req.Documents {
+		id := d.ID
+		if id == "" {
+			id = fmt.Sprintf("%d-%d", time.Now().UnixNano(), i)
+		}
+		if d.Content == "" {
+			errs = append(errs, batchError{ID: id, Error: "content is required"})
+			continue
+		}
+		if _, err := se.Process(r.Context(), id, d.Content); err != nil {
+			errs = append(errs, batchError{ID: id, Error: err.Error()})
+			continue
+		}
+		indexed++
+	}
+
+	// Persist the whole batch in a single snapshot write — the point of this
+	// endpoint. Skip it if nothing was indexed so a fully-failed batch leaves
+	// disk untouched.
+	if indexed > 0 {
+		m.persist(se)
+	}
+
+	status := http.StatusCreated
+	if indexed == 0 {
+		status = http.StatusBadRequest
+	}
+	jsonResponse(w, map[string]any{"indexed": indexed, "failed": len(errs), "errors": errs}, status)
 }
 
 func (m *Manager) getDocument(w http.ResponseWriter, r *http.Request) {
