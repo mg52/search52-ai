@@ -76,6 +76,21 @@ non-root user); mount a named volume or host path there to persist indexes acros
 restarts. The container exposes `8080`; point your orchestrator's liveness/
 readiness probe at `GET /health`.
 
+### Docker Compose
+
+`docker-compose.yml` runs the full stack — Ollama, a one-shot init that pulls
+`nomic-embed-text` into it, and the service — with no local setup beyond Docker:
+
+```bash
+docker compose up --build
+```
+
+`ollama-pull` blocks `search52-ai` from starting until the model has finished
+downloading (`service_completed_successfully`), so the first request never races
+a missing model. Both Ollama's model cache and the service's index snapshots are
+kept in named volumes (`ollama_data`, `search52_data`) and survive
+`docker compose down` (add `-v` to wipe them).
+
 ## Configuration
 
 | Variable                 | Default   | Description                                          |

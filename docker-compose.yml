@@ -1,0 +1,46 @@
+services:
+  ollama:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # One-shot init: pulls the embedding model into the shared ollama_data volume,
+  # then exits. The app waits for this to complete successfully before it starts,
+  # so the first real request never race against a missing model.
+  ollama-pull:
+    image: ollama/ollama:latest
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    entrypoint: ["ollama", "pull", "nomic-embed-text"]
+
+  search52-ai:
+    build: .
+    depends_on:
+      ollama:
+        condition: service_healthy
+      ollama-pull:
+        condition: service_completed_successfully
+    environment:
+      EMBEDDING_BASE_URL: http://ollama:11434/v1
+      EMBEDDING_API_KEY: ollama
+      EMBEDDING_MODEL: nomic-embed-text
+      DATA_DIR: /data
+    ports:
+      - "8080:8080"
+    volumes:
+      - search52_data:/data
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  search52_data:
