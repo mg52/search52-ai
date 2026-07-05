@@ -72,6 +72,8 @@ func (m *Manager) Routes() *http.ServeMux {
 	mux.HandleFunc("GET /indexes", m.listIndexes)
 	mux.HandleFunc("DELETE /indexes/{index}", m.deleteIndex)
 
+	mux.HandleFunc("POST /indexes/{index}/persist", m.persistIndex)
+
 	mux.HandleFunc("POST /indexes/{index}/documents", m.createDocument)
 	mux.HandleFunc("POST /indexes/{index}/documents/batch", m.batchDocuments)
 	mux.HandleFunc("GET /indexes/{index}/documents/{id}", m.getDocument)
@@ -206,6 +208,22 @@ func (m *Manager) deleteIndex(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+// persistIndex writes the named index's current in-memory state to disk on
+// demand. Document ingestion no longer persists after every write; callers
+// must invoke this endpoint to snapshot the index.
+func (m *Manager) persistIndex(w http.ResponseWriter, r *http.Request) {
+	se := m.index(w, r)
+	if se == nil {
+		return
+	}
+	if err := se.Save(filepath.Join(m.dataDir, se.Name())); err != nil {
+		log.Printf("manager: persist %q: %v", se.Name(), err)
+		jsonError(w, "persist failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	jsonResponse(w, map[string]any{"name": se.Name(), "persisted": true}, http.StatusOK)
+}
+
 // -------------------- documents --------------------
 
 type documentReq struct {
@@ -240,7 +258,6 @@ func (m *Manager) createDocument(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "categorization failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	m.persist(se)
 	jsonResponse(w, doc, http.StatusCreated)
 }
 
@@ -254,12 +271,12 @@ type batchError struct {
 }
 
 // batchDocuments ingests many documents in one request. Every document is
-// embedded and clustered in order, then the index is persisted exactly ONCE at
-// the end — not per document — so a bulk load pays a single snapshot write
-// instead of one per item. Individual failures (empty content, embedding
-// errors) are collected and reported without aborting the rest of the batch.
-// A document whose id already exists is re-processed (its content and category
-// memberships are replaced), so a batch acts as an upsert.
+// embedded and clustered in order. Ingestion no longer persists to disk;
+// call POST /indexes/{index}/persist once the batch is done. Individual
+// failures (empty content, embedding errors) are collected and reported
+// without aborting the rest of the batch. A document whose id already
+// exists is re-processed (its content and category memberships are
+// replaced), so a batch acts as an upsert.
 func (m *Manager) batchDocuments(w http.ResponseWriter, r *http.Request) {
 	se := m.index(w, r)
 	if se == nil {
@@ -291,13 +308,6 @@ func (m *Manager) batchDocuments(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		indexed++
-	}
-
-	// Persist the whole batch in a single snapshot write — the point of this
-	// endpoint. Skip it if nothing was indexed so a fully-failed batch leaves
-	// disk untouched.
-	if indexed > 0 {
-		m.persist(se)
 	}
 
 	status := http.StatusCreated
@@ -345,7 +355,6 @@ func (m *Manager) updateDocument(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "categorization failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	m.persist(se)
 	jsonResponse(w, doc, http.StatusOK)
 }
 
@@ -358,7 +367,6 @@ func (m *Manager) deleteDocument(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "document not found", http.StatusNotFound)
 		return
 	}
-	m.persist(se)
 	w.WriteHeader(http.StatusNoContent)
 }
 
