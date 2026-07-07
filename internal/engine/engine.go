@@ -42,6 +42,14 @@ type Document struct {
 	Vector     []float32 `json:"-"`
 	Norm       float32   `json:"-"` // cached L2 norm of Vector
 	CreatedAt  time.Time `json:"created_at"`
+
+	// ForcedFallback is true when Categories was assigned via the
+	// maxCategories cap-reached "nearest wins" fallback in assignLocked
+	// rather than a genuine >=threshold match. Such a doc's vector is
+	// excluded from its category's centroid (see addToCentroidLocked) so an
+	// unrelated document dumped into the nearest category at cap can't drag
+	// that centroid away from its real members.
+	ForcedFallback bool `json:"-"`
 }
 
 // Category is an incrementally-discovered cluster. Centroid holds the running
@@ -158,10 +166,10 @@ func (se *SearchEngine) Process(ctx context.Context, id, content string) (Docume
 		se.detachLocked(old)
 	}
 
-	doc.Categories = se.assignLocked(v, norm)
+	doc.Categories, doc.ForcedFallback = se.assignLocked(v, norm)
 	se.docs[id] = doc
 	for _, name := range doc.Categories {
-		se.addToCentroidLocked(name, v)
+		se.addToCentroidLocked(name, v, !doc.ForcedFallback)
 		se.addDocToCategoryLocked(id, name)
 	}
 	return doc, nil
@@ -356,7 +364,10 @@ func sharesEarlierCategory(docCats []string, earlier []CategoryMatch) bool {
 // assignLocked picks the categories for a vector: every existing category whose
 // cosine similarity is >= threshold (up to maxPerDoc, highest first); otherwise
 // a new category, or — when the maxCategories cap is hit — the single nearest.
-func (se *SearchEngine) assignLocked(v []float32, norm float32) []string {
+// The second return value reports whether that last case fired: a forced,
+// sub-threshold assignment that the caller must exclude from the category's
+// centroid math (see Document.ForcedFallback).
+func (se *SearchEngine) assignLocked(v []float32, norm float32) ([]string, bool) {
 	type catSim struct {
 		name string
 		sim  float32
@@ -383,9 +394,10 @@ func (se *SearchEngine) assignLocked(v []float32, norm float32) []string {
 			assigned = append(assigned, se.newCategoryLocked())
 		case len(sims) > 0:
 			assigned = append(assigned, sims[0].name) // cap reached: nearest wins
+			return assigned, true
 		}
 	}
-	return assigned
+	return assigned, false
 }
 
 func (se *SearchEngine) newCategoryLocked() string {
@@ -395,12 +407,18 @@ func (se *SearchEngine) newCategoryLocked() string {
 	return name
 }
 
-// addToCentroidLocked folds v into a category's running centroid sum. Mutation
-// happens in place: search only reads centroids under RLock, so it never
-// overlaps this write.
-func (se *SearchEngine) addToCentroidLocked(name string, v []float32) {
+// addToCentroidLocked folds v into a category's running centroid sum, unless
+// updateCentroid is false (a ForcedFallback assignment), in which case the doc
+// is still counted as a member but its vector never touches the centroid.
+// Mutation happens in place: search only reads centroids under RLock, so it
+// never overlaps this write.
+func (se *SearchEngine) addToCentroidLocked(name string, v []float32, updateCentroid bool) {
 	c, ok := se.categories[name]
 	if !ok {
+		return
+	}
+	c.Count++
+	if !updateCentroid {
 		return
 	}
 	if c.Centroid == nil {
@@ -409,13 +427,14 @@ func (se *SearchEngine) addToCentroidLocked(name string, v []float32) {
 	for i := range v {
 		c.Centroid[i] += v[i]
 	}
-	c.Count++
 	c.Norm = vec.Norm(c.Centroid)
 }
 
 // removeFromCentroidLocked subtracts v from a category's centroid sum, pruning
-// the category when its last member leaves.
-func (se *SearchEngine) removeFromCentroidLocked(name string, v []float32) {
+// the category when its last member leaves. updateCentroid must mirror the
+// value passed to the matching addToCentroidLocked call, or the subtraction
+// would corrupt a centroid the doc's vector was never folded into.
+func (se *SearchEngine) removeFromCentroidLocked(name string, v []float32, updateCentroid bool) {
 	c, ok := se.categories[name]
 	if !ok {
 		return
@@ -424,6 +443,9 @@ func (se *SearchEngine) removeFromCentroidLocked(name string, v []float32) {
 	if c.Count <= 0 {
 		delete(se.categories, name)
 		delete(se.catDocs, name)
+		return
+	}
+	if !updateCentroid {
 		return
 	}
 	for i := range v {
@@ -446,7 +468,7 @@ func (se *SearchEngine) addDocToCategoryLocked(id, name string) {
 // detachLocked removes a document's contribution to every category it belonged to.
 func (se *SearchEngine) detachLocked(doc Document) {
 	for _, name := range doc.Categories {
-		se.removeFromCentroidLocked(name, doc.Vector)
+		se.removeFromCentroidLocked(name, doc.Vector, !doc.ForcedFallback)
 		if set := se.catDocs[name]; set != nil {
 			delete(set, doc.ID)
 		}

@@ -28,12 +28,13 @@ type snapshot struct {
 }
 
 type docSnapshot struct {
-	ID         string
-	Content    string
-	Categories []string
-	Vector     []float32
-	Norm       float32
-	CreatedAt  time.Time
+	ID             string
+	Content        string
+	Categories     []string
+	Vector         []float32
+	Norm           float32
+	CreatedAt      time.Time
+	ForcedFallback bool
 }
 
 type catSnapshot struct {
@@ -62,12 +63,13 @@ func (se *SearchEngine) Save(dir string) error {
 	}
 	for _, d := range se.docs {
 		snap.Documents = append(snap.Documents, docSnapshot{
-			ID:         d.ID,
-			Content:    d.Content,
-			Categories: d.Categories,
-			Vector:     d.Vector,
-			Norm:       d.Norm,
-			CreatedAt:  d.CreatedAt,
+			ID:             d.ID,
+			Content:        d.Content,
+			Categories:     d.Categories,
+			Vector:         d.Vector,
+			Norm:           d.Norm,
+			CreatedAt:      d.CreatedAt,
+			ForcedFallback: d.ForcedFallback,
 		})
 	}
 	for _, c := range se.categories {
@@ -144,12 +146,13 @@ func Load(dir string, embedder Embedder) (*SearchEngine, error) {
 	se.nextCategoryID = snap.NextCategoryID
 	for _, d := range snap.Documents {
 		se.docs[d.ID] = Document{
-			ID:         d.ID,
-			Content:    d.Content,
-			Categories: d.Categories,
-			Vector:     d.Vector,
-			Norm:       d.Norm,
-			CreatedAt:  d.CreatedAt,
+			ID:             d.ID,
+			Content:        d.Content,
+			Categories:     d.Categories,
+			Vector:         d.Vector,
+			Norm:           d.Norm,
+			CreatedAt:      d.CreatedAt,
+			ForcedFallback: d.ForcedFallback,
 		}
 	}
 	for _, c := range snap.Categories {
