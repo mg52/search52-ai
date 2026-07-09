@@ -23,6 +23,8 @@ func main() {
 		MaxCategoriesPerDoc: cfg.MaxCategoriesPerDoc,
 		MaxCategories:       cfg.MaxCategories,
 		TopNCategories:      cfg.TopNCategories,
+		VarianceThreshold:   cfg.VarianceThreshold,
+		VarianceMinCount:    cfg.VarianceMinCount,
 	})
 	if err := mgr.LoadExisting(); err != nil {
 		log.Fatalf("load indexes: %v", err)

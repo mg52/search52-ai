@@ -2,6 +2,7 @@ package engine
 
 import (
 	"context"
+	"math"
 	"strings"
 	"testing"
 )
@@ -227,5 +228,151 @@ func TestSearchDeduplicatesMultiCategoryDoc(t *testing.T) {
 	}
 	if seen["both"] != 1 {
 		t.Fatalf("doc 'both' should appear exactly once, got %d", seen["both"])
+	}
+}
+
+func TestCategoryVarianceFlagsShouldSplit(t *testing.T) {
+	// threshold 0 + a single category cap forces every doc into one category
+	// regardless of similarity, so its member similarities vary a lot.
+	se := New("t", fakeEmbedder{}, Config{
+		CategoryThreshold: 0, MaxCategoriesPerDoc: 1, MaxCategories: 1, TopNCategories: 3,
+		VarianceThreshold: 0, VarianceMinCount: 2, // 2 lets this 3-member category clear the gate
+	})
+	ctx := context.Background()
+
+	doc1, err := se.Process(ctx, "a1", "sony wireless headphones audio")
+	if err != nil {
+		t.Fatalf("process a1: %v", err)
+	}
+	catName := doc1.Categories[0]
+	cat, ok := se.GetCategory(catName)
+	if !ok {
+		t.Fatalf("category %q missing", catName)
+	}
+	if cat.ShouldSplit || cat.Variance != 0 {
+		t.Fatalf("category founder must not seed the Welford stream (trivial self-similarity), got variance %v", cat.Variance)
+	}
+
+	// First real member: still only one Welford sample, so variance stays 0
+	// (Variance needs >=2 samples) and ShouldSplit can't fire yet.
+	if _, err := se.Process(ctx, "m1", "medical stethoscope"); err != nil {
+		t.Fatalf("process m1: %v", err)
+	}
+	cat, _ = se.GetCategory(catName)
+	if cat.ShouldSplit || cat.Variance != 0 {
+		t.Fatalf("a single real sample has no variance yet, should not flag split, got %v", cat.Variance)
+	}
+
+	// Second real member shares vocab with both a1 and m1, so it lands at a
+	// different, non-zero similarity to the now-updated centroid — joining
+	// the same category (threshold 0) and widening the running variance
+	// past VarianceThreshold=0.
+	if _, err := se.Process(ctx, "m2", "audio medical"); err != nil {
+		t.Fatalf("process m2: %v", err)
+	}
+	cat, _ = se.GetCategory(catName)
+	if !cat.ShouldSplit {
+		t.Fatalf("dissimilar second real member should push variance above threshold and flip ShouldSplit")
+	}
+	if cat.Variance <= 0 {
+		t.Fatalf("expected positive variance, got %v", cat.Variance)
+	}
+}
+
+// TestVarianceStabilizesForLongHomogeneousStream shows that a category kept
+// fed with similar (not identical) similarity values does not shrink toward
+// zero forever: the early monotonic decline seen with few samples is just a
+// noisy small-n variance estimate settling toward the stream's true, fixed
+// variance. Feeding 1000 more values from the same distribution does not
+// keep driving it down further.
+func TestVarianceStabilizesForLongHomogeneousStream(t *testing.T) {
+	se := New("t", fakeEmbedder{}, Config{})
+	se.categories["c"] = &Category{Name: "c"}
+
+	// Alternating mean±delta has an exact, fixed population variance of
+	// delta^2. Sample variance (n-1 denominator) converges to it from above
+	// as n grows: n/(n-1) * delta^2.
+	const mean, delta = 0.8, 0.05
+	for i := 0; i < 1000; i++ {
+		sim := mean - delta
+		if i%2 == 1 {
+			sim = mean + delta
+		}
+		se.updateVarianceLocked("c", float32(sim))
+	}
+	got := se.categories["c"].Variance
+	want := delta * delta
+	if diff := math.Abs(got - want); diff > 5e-4 {
+		t.Fatalf("variance should stabilize near %v for a bounded homogeneous stream, got %v (diff %v)", want, got, diff)
+	}
+}
+
+// TestVarianceRisesWhenDistantDocumentsJoin shows the other half of the
+// story: once a category's variance has settled low on a tight cluster, a
+// run of genuinely distant documents joining it (still passing the category
+// threshold, just far from the established members) pushes the variance back
+// up — it does not keep declining regardless of what joins.
+func TestVarianceRisesWhenDistantDocumentsJoin(t *testing.T) {
+	se := New("t", fakeEmbedder{}, Config{}) // VarianceThreshold defaults to 0.02
+	se.categories["c"] = &Category{Name: "c"}
+
+	// 200 members all at the exact same similarity: a perfectly tight
+	// cluster, variance settles at (not just near) zero. Count is bumped
+	// alongside each update, mirroring Process's real addToCentroidLocked +
+	// updateVarianceLocked order, so this category also clears the default
+	// VarianceMinCount (100) gate.
+	for i := 0; i < 200; i++ {
+		se.categories["c"].Count++
+		se.updateVarianceLocked("c", 0.85)
+	}
+	stable := se.categories["c"].Variance
+	if stable != 0 {
+		t.Fatalf("expected exactly 0 variance for an identical-similarity stream, got %v", stable)
+	}
+	if se.categories["c"].ShouldSplit {
+		t.Fatalf("a tight, stable cluster should not be flagged for split")
+	}
+
+	// 20 distant documents (sim 0.2 vs the established ~0.85) join the same
+	// category. Variance must rise, and with enough of a gap it should clear
+	// the default threshold and flag the category.
+	for i := 0; i < 20; i++ {
+		se.categories["c"].Count++
+		se.updateVarianceLocked("c", 0.2)
+	}
+	got := se.categories["c"].Variance
+	if got <= stable {
+		t.Fatalf("variance should increase once distant documents join a stable category, got %v (was %v)", got, stable)
+	}
+	if !se.categories["c"].ShouldSplit {
+		t.Fatalf("variance %v should have exceeded the threshold and flagged ShouldSplit", got)
+	}
+}
+
+// TestShouldSplitRequiresMinimumCount verifies the VarianceMinCount gate: a
+// young category must not be flagged for split just because a couple of
+// wildly different samples spike its variance — only once it has accrued
+// enough members for that variance estimate to be meaningful.
+func TestShouldSplitRequiresMinimumCount(t *testing.T) {
+	se := New("t", fakeEmbedder{}, Config{VarianceThreshold: 0}) // VarianceMinCount defaults to 100
+	se.categories["c"] = &Category{Name: "c"}
+
+	// Two far-apart samples give a large variance, comfortably above the
+	// zero threshold, but Count is still 0 (< VarianceMinCount).
+	se.updateVarianceLocked("c", 0.9)
+	se.updateVarianceLocked("c", 0.1)
+	if se.categories["c"].Variance <= 0 {
+		t.Fatalf("expected positive variance, got %v", se.categories["c"].Variance)
+	}
+	if se.categories["c"].ShouldSplit {
+		t.Fatalf("a young category (Count below VarianceMinCount) must not flag split despite high variance")
+	}
+
+	// Once Count clears the default VarianceMinCount (100), the same
+	// high-variance category should flag on its next update.
+	se.categories["c"].Count = 101
+	se.updateVarianceLocked("c", 0.1)
+	if !se.categories["c"].ShouldSplit {
+		t.Fatalf("a mature category (Count above VarianceMinCount) with variance above threshold should flag ShouldSplit")
 	}
 }

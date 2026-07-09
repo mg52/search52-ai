@@ -315,6 +315,12 @@ func TestCategoriesEndpoints(t *testing.T) {
 	if _, ok := first["created_at"]; !ok {
 		t.Fatalf("category summary missing created_at")
 	}
+	if _, ok := first["variance"]; !ok {
+		t.Fatalf("category summary missing variance")
+	}
+	if _, ok := first["should_split"]; !ok {
+		t.Fatalf("category summary missing should_split")
+	}
 
 	// Get a real category and a missing one.
 	code, body := do(t, srv, "GET", "/indexes/i/categories/"+name, "")
@@ -323,6 +329,12 @@ func TestCategoriesEndpoints(t *testing.T) {
 	}
 	if body["vector_dims"].(float64) == 0 {
 		t.Fatalf("expected non-zero vector_dims, got %v", body["vector_dims"])
+	}
+	if _, ok := body["variance"]; !ok {
+		t.Fatalf("category detail missing variance")
+	}
+	if _, ok := body["should_split"]; !ok {
+		t.Fatalf("category detail missing should_split")
 	}
 	if code, _ = do(t, srv, "GET", "/indexes/i/categories/nope", ""); code != http.StatusNotFound {
 		t.Fatalf("get missing category: %d", code)

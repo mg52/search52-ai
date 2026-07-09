@@ -55,12 +55,29 @@ type Document struct {
 // Category is an incrementally-discovered cluster. Centroid holds the running
 // SUM of member document vectors; Norm caches its L2 norm; Count is the number
 // of member documents. Categories are auto-named ("category1", …).
+//
+// welfordCount/welfordMean/welfordM2 implement Welford's online algorithm,
+// tracking the running variance of each member's cosine similarity to the
+// centroid at the moment it was assigned. Welford only accumulates — it has
+// no exact inverse update — so these are never adjusted on document removal.
+// Variance is the resulting sample variance; ShouldSplit flips true once
+// Variance exceeds the engine's varianceThreshold AND Count exceeds
+// varianceMinCount, so a category isn't flagged while it's still too young
+// for the variance estimate to be meaningful. No split is performed yet,
+// this only flags the category as a candidate.
 type Category struct {
 	Name      string    `json:"name"`
 	Centroid  []float32 `json:"-"`
 	Norm      float32   `json:"-"`
 	Count     int       `json:"count"`
 	CreatedAt time.Time `json:"created_at"`
+
+	welfordCount int
+	welfordMean  float64
+	welfordM2    float64
+
+	Variance    float64 `json:"variance"`
+	ShouldSplit bool    `json:"should_split"`
 }
 
 // SearchResult is a ranked document with its similarity score.
@@ -89,6 +106,8 @@ type Config struct {
 	MaxCategoriesPerDoc int     // cap on categories one document may join
 	MaxCategories       int     // cap on total categories
 	TopNCategories      int     // nearest categories scanned per query
+	VarianceThreshold   float64 // Welford variance above which a category's ShouldSplit flips true
+	VarianceMinCount    int     // min category member count before ShouldSplit can fire
 }
 
 func (c *Config) withDefaults() {
@@ -101,6 +120,12 @@ func (c *Config) withDefaults() {
 	if c.TopNCategories <= 0 {
 		c.TopNCategories = 3
 	}
+	if c.VarianceThreshold <= 0 {
+		c.VarianceThreshold = 0.02
+	}
+	if c.VarianceMinCount <= 0 {
+		c.VarianceMinCount = 100
+	}
 }
 
 // SearchEngine is one index: documents, categories, and the search over them,
@@ -109,10 +134,12 @@ type SearchEngine struct {
 	name     string
 	embedder Embedder
 
-	threshold     float32
-	maxPerDoc     int
-	maxCategories int
-	topN          int
+	threshold         float32
+	maxPerDoc         int
+	maxCategories     int
+	topN              int
+	varianceThreshold float64
+	varianceMinCount  int
 
 	mu             sync.RWMutex
 	docs           map[string]Document            // doc ID -> document
@@ -125,15 +152,17 @@ type SearchEngine struct {
 func New(name string, embedder Embedder, cfg Config) *SearchEngine {
 	cfg.withDefaults()
 	return &SearchEngine{
-		name:          name,
-		embedder:      embedder,
-		threshold:     float32(cfg.CategoryThreshold),
-		maxPerDoc:     cfg.MaxCategoriesPerDoc,
-		maxCategories: cfg.MaxCategories,
-		topN:          cfg.TopNCategories,
-		docs:          make(map[string]Document),
-		categories:    make(map[string]*Category),
-		catDocs:       make(map[string]map[string]struct{}),
+		name:              name,
+		embedder:          embedder,
+		threshold:         float32(cfg.CategoryThreshold),
+		maxPerDoc:         cfg.MaxCategoriesPerDoc,
+		maxCategories:     cfg.MaxCategories,
+		topN:              cfg.TopNCategories,
+		varianceThreshold: cfg.VarianceThreshold,
+		varianceMinCount:  cfg.VarianceMinCount,
+		docs:              make(map[string]Document),
+		categories:        make(map[string]*Category),
+		catDocs:           make(map[string]map[string]struct{}),
 	}
 }
 
@@ -166,11 +195,23 @@ func (se *SearchEngine) Process(ctx context.Context, id, content string) (Docume
 		se.detachLocked(old)
 	}
 
-	doc.Categories, doc.ForcedFallback = se.assignLocked(v, norm)
+	assignments, forced := se.assignLocked(v, norm)
+	doc.ForcedFallback = forced
+	doc.Categories = make([]string, len(assignments))
+	for i, a := range assignments {
+		doc.Categories[i] = a.name
+	}
 	se.docs[id] = doc
-	for _, name := range doc.Categories {
-		se.addToCentroidLocked(name, v, !doc.ForcedFallback)
-		se.addDocToCategoryLocked(id, name)
+	for _, a := range assignments {
+		se.addToCentroidLocked(a.name, v, !forced)
+		se.addDocToCategoryLocked(id, a.name)
+		if !a.founding {
+			se.updateVarianceLocked(a.name, a.sim)
+		}
+		c, ok := se.categories[a.name]
+		if ok {
+			fmt.Println(id, c.Name, c.Variance, a.founding)
+		}
 	}
 	return doc, nil
 }
@@ -361,13 +402,25 @@ func sharesEarlierCategory(docCats []string, earlier []CategoryMatch) bool {
 
 // -------------------- clustering (caller holds the write lock) --------------------
 
+// catAssignment pairs an assigned category name with the cosine similarity
+// that earned it, so the caller can feed that value into the category's
+// running Welford variance (see updateVarianceLocked). founding is true when
+// this assignment just seeded a brand-new category: that doc trivially has
+// similarity 1 to a centroid that is nothing but its own vector, which isn't
+// a real similarity sample, so the caller must skip the Welford update for it.
+type catAssignment struct {
+	name     string
+	sim      float32
+	founding bool
+}
+
 // assignLocked picks the categories for a vector: every existing category whose
 // cosine similarity is >= threshold (up to maxPerDoc, highest first); otherwise
 // a new category, or — when the maxCategories cap is hit — the single nearest.
 // The second return value reports whether that last case fired: a forced,
 // sub-threshold assignment that the caller must exclude from the category's
 // centroid math (see Document.ForcedFallback).
-func (se *SearchEngine) assignLocked(v []float32, norm float32) ([]string, bool) {
+func (se *SearchEngine) assignLocked(v []float32, norm float32) ([]catAssignment, bool) {
 	type catSim struct {
 		name string
 		sim  float32
@@ -381,19 +434,19 @@ func (se *SearchEngine) assignLocked(v []float32, norm float32) ([]string, bool)
 	}
 	sort.Slice(sims, func(i, j int) bool { return sims[i].sim > sims[j].sim })
 
-	var assigned []string
+	var assigned []catAssignment
 	for _, sc := range sims {
 		if sc.sim < se.threshold || len(assigned) >= se.maxPerDoc {
 			break
 		}
-		assigned = append(assigned, sc.name)
+		assigned = append(assigned, catAssignment{name: sc.name, sim: sc.sim})
 	}
 	if len(assigned) == 0 {
 		switch {
 		case len(se.categories) < se.maxCategories:
-			assigned = append(assigned, se.newCategoryLocked())
+			assigned = append(assigned, catAssignment{name: se.newCategoryLocked(), founding: true})
 		case len(sims) > 0:
-			assigned = append(assigned, sims[0].name) // cap reached: nearest wins
+			assigned = append(assigned, catAssignment{name: sims[0].name, sim: sims[0].sim}) // cap reached: nearest wins
 			return assigned, true
 		}
 	}
@@ -454,6 +507,32 @@ func (se *SearchEngine) removeFromCentroidLocked(name string, v []float32, updat
 		}
 	}
 	c.Norm = vec.Norm(c.Centroid)
+}
+
+// updateVarianceLocked folds a member's assignment-time similarity to the
+// centroid into that category's running Welford statistics, giving an
+// O(1)-per-document, single-pass estimate of the category's spread without
+// keeping every similarity value around. It runs once per (document,
+// category) pair whenever a document joins an existing category — the
+// caller skips it for the document that founds a brand-new category, since
+// that doc's "similarity" to a centroid that is nothing but its own vector
+// (1.0) isn't a real sample and would bias the running variance. There is
+// also no corresponding update on removal (Welford has no exact inverse).
+// ShouldSplit is a flag only — no split is performed here.
+func (se *SearchEngine) updateVarianceLocked(name string, sim float32) {
+	c, ok := se.categories[name]
+	if !ok {
+		return
+	}
+	c.welfordCount++
+	x := float64(sim)
+	delta := x - c.welfordMean
+	c.welfordMean += delta / float64(c.welfordCount)
+	c.welfordM2 += delta * (x - c.welfordMean)
+	if c.welfordCount > 1 {
+		c.Variance = c.welfordM2 / float64(c.welfordCount-1)
+	}
+	c.ShouldSplit = c.Variance > se.varianceThreshold && c.Count > se.varianceMinCount
 }
 
 func (se *SearchEngine) addDocToCategoryLocked(id, name string) {

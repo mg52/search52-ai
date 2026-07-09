@@ -123,6 +123,8 @@ type createIndexReq struct {
 	MaxCategoriesPerDoc int     `json:"max_categories_per_doc"`
 	MaxCategories       int     `json:"max_categories"`
 	TopNCategories      int     `json:"top_n_categories"`
+	VarianceThreshold   float64 `json:"variance_threshold"`
+	VarianceMinCount    int     `json:"variance_min_count"`
 }
 
 func (m *Manager) createIndex(w http.ResponseWriter, r *http.Request) {
@@ -149,6 +151,12 @@ func (m *Manager) createIndex(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.TopNCategories > 0 {
 		cfg.TopNCategories = req.TopNCategories
+	}
+	if req.VarianceThreshold > 0 {
+		cfg.VarianceThreshold = req.VarianceThreshold
+	}
+	if req.VarianceMinCount > 0 {
+		cfg.VarianceMinCount = req.VarianceMinCount
 	}
 
 	m.mu.Lock()
@@ -380,13 +388,21 @@ func (m *Manager) listCategories(w http.ResponseWriter, r *http.Request) {
 	cats := se.ListCategories()
 	sort.Slice(cats, func(i, j int) bool { return cats[i].Name < cats[j].Name })
 	type categorySummary struct {
-		Name      string    `json:"name"`
-		DocCount  int       `json:"doc_count"`
-		CreatedAt time.Time `json:"created_at"`
+		Name        string    `json:"name"`
+		DocCount    int       `json:"doc_count"`
+		CreatedAt   time.Time `json:"created_at"`
+		Variance    float64   `json:"variance"`
+		ShouldSplit bool      `json:"should_split"`
 	}
 	summaries := make([]categorySummary, len(cats))
 	for i, c := range cats {
-		summaries[i] = categorySummary{Name: c.Name, DocCount: se.DocCountByCategory(c.Name), CreatedAt: c.CreatedAt}
+		summaries[i] = categorySummary{
+			Name:        c.Name,
+			DocCount:    se.DocCountByCategory(c.Name),
+			CreatedAt:   c.CreatedAt,
+			Variance:    c.Variance,
+			ShouldSplit: c.ShouldSplit,
+		}
 	}
 	jsonResponse(w, summaries, http.StatusOK)
 }
@@ -403,10 +419,12 @@ func (m *Manager) getCategory(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jsonResponse(w, map[string]any{
-		"name":        c.Name,
-		"doc_count":   se.DocCountByCategory(name),
-		"vector_dims": len(c.Centroid),
-		"created_at":  c.CreatedAt,
+		"name":         c.Name,
+		"doc_count":    se.DocCountByCategory(name),
+		"vector_dims":  len(c.Centroid),
+		"created_at":   c.CreatedAt,
+		"variance":     c.Variance,
+		"should_split": c.ShouldSplit,
 	}, http.StatusOK)
 }
 

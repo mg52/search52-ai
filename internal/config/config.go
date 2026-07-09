@@ -18,6 +18,8 @@ type Config struct {
 	MaxCategoriesPerDoc int     // cap on categories one document may join
 	MaxCategories       int     // cap on total categories
 	TopNCategories      int     // nearest categories scanned per query
+	VarianceThreshold   float64 // Welford variance above which a category's ShouldSplit flips true
+	VarianceMinCount    int     // min category member count before ShouldSplit can fire
 }
 
 func Load() (*Config, error) {
@@ -54,6 +56,12 @@ func Load() (*Config, error) {
 		return nil, err
 	}
 	if c.TopNCategories, err = parseInt("TOP_N_CATEGORIES", "3"); err != nil {
+		return nil, err
+	}
+	if c.VarianceThreshold, err = parseFloat("VARIANCE_THRESHOLD", "0.02"); err != nil {
+		return nil, err
+	}
+	if c.VarianceMinCount, err = parseInt("VARIANCE_MIN_COUNT", "100"); err != nil {
 		return nil, err
 	}
 
