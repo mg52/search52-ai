@@ -146,6 +146,12 @@ type SearchEngine struct {
 	categories     map[string]*Category           // name -> category
 	catDocs        map[string]map[string]struct{} // category name -> set of doc IDs
 	nextCategoryID int                            // monotonic; never reuses a pruned name
+
+	// splitting holds the names of categories with a split goroutine
+	// currently in flight, so a run of documents all flipping the same
+	// category's ShouldSplit doesn't spawn one splitCategory per document.
+	// Always accessed under mu (write-locked), never under RLock.
+	splitting map[string]bool
 }
 
 // New constructs an empty index named name.
@@ -163,6 +169,7 @@ func New(name string, embedder Embedder, cfg Config) *SearchEngine {
 		docs:              make(map[string]Document),
 		categories:        make(map[string]*Category),
 		catDocs:           make(map[string]map[string]struct{}),
+		splitting:         make(map[string]bool),
 	}
 }
 
@@ -170,6 +177,10 @@ func (se *SearchEngine) Name() string { return se.name }
 
 // Process embeds content and clusters it under id, replacing any existing
 // document with that id (its stale category memberships are detached first).
+// If this assignment flips a category's ShouldSplit flag, Process launches a
+// splitCategory goroutine for it (see split.go) and returns without waiting
+// on it — the split runs asynchronously and folds its result back into live
+// state on its own.
 func (se *SearchEngine) Process(ctx context.Context, id, content string) (Document, error) {
 	if id == "" {
 		return Document{}, fmt.Errorf("document id is required")
@@ -187,7 +198,6 @@ func (se *SearchEngine) Process(ctx context.Context, id, content string) (Docume
 	}
 
 	se.mu.Lock()
-	defer se.mu.Unlock()
 
 	doc := Document{ID: id, Content: content, Vector: v, Norm: norm, CreatedAt: time.Now()}
 	if old, ok := se.docs[id]; ok {
@@ -202,17 +212,30 @@ func (se *SearchEngine) Process(ctx context.Context, id, content string) (Docume
 		doc.Categories[i] = a.name
 	}
 	se.docs[id] = doc
+
+	// Categories whose ShouldSplit just flipped true get a splitCategory
+	// goroutine launched below, once mu is released — split.go's asynchronous
+	// clustering must never run while the write lock is held. splitting
+	// guards against launching a second one while an earlier split for the
+	// same category is still in flight.
+	var toSplit []string
 	for _, a := range assignments {
 		se.addToCentroidLocked(a.name, v, !forced)
 		se.addDocToCategoryLocked(id, a.name)
 		if !a.founding {
 			se.updateVarianceLocked(a.name, a.sim)
 		}
-		c, ok := se.categories[a.name]
-		if ok {
-			fmt.Println(id, c.Name, c.Variance, a.founding)
+		if c, ok := se.categories[a.name]; ok && c.ShouldSplit && !se.splitting[a.name] {
+			se.splitting[a.name] = true
+			toSplit = append(toSplit, a.name)
 		}
 	}
+	se.mu.Unlock()
+
+	for _, name := range toSplit {
+		go se.splitCategory(name)
+	}
+
 	return doc, nil
 }
 
