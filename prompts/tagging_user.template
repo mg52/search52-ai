@@ -1,0 +1,4 @@
+Existing categories: {{.ExistingCategories}}
+Document: {{.Content}}
+
+Reply with ONLY: {"categories": ["category1", "category2"]}

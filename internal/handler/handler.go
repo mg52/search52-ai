@@ -19,22 +19,23 @@ import (
 // so they can be used directly as directory names.
 var indexNamePattern = regexp.MustCompile(`^[A-Za-z0-9_.-]{1,128}$`)
 
-// Manager owns every index and the shared embedder. Each index is a
-// self-contained engine.SearchEngine persisted under dataDir/<name>/.
+// Manager owns every index and the shared clients (embedder, LLM). Each
+// index is a self-contained engine.Index — embedding-clustered or
+// LLM-categorized — persisted under dataDir/<name>/.
 type Manager struct {
 	mu       sync.RWMutex
 	dataDir  string
-	embedder engine.Embedder
+	deps     engine.Deps
 	defaults engine.Config
-	indexes  map[string]*engine.SearchEngine
+	indexes  map[string]engine.Index
 }
 
-func NewManager(dataDir string, embedder engine.Embedder, defaults engine.Config) *Manager {
+func NewManager(dataDir string, deps engine.Deps, defaults engine.Config) *Manager {
 	return &Manager{
 		dataDir:  dataDir,
-		embedder: embedder,
+		deps:     deps,
 		defaults: defaults,
-		indexes:  make(map[string]*engine.SearchEngine),
+		indexes:  make(map[string]engine.Index),
 	}
 }
 
@@ -55,13 +56,13 @@ func (m *Manager) LoadExisting() error {
 			continue
 		}
 		dir := filepath.Join(m.dataDir, e.Name())
-		se, err := engine.Load(dir, m.embedder)
+		idx, err := engine.Load(dir, m.deps)
 		if err != nil {
 			log.Printf("manager: skipping %s: %v", e.Name(), err)
 			continue
 		}
-		m.indexes[se.Name()] = se
-		log.Printf("manager: loaded index %q (%d docs, %d categories)", se.Name(), se.DocCount(), se.CategoryCount())
+		m.indexes[idx.Name()] = idx
+		log.Printf("manager: loaded %s index %q (%d docs, %d categories)", idx.Kind(), idx.Name(), idx.DocCount(), idx.CategoryCount())
 	}
 	return nil
 }
@@ -91,40 +92,35 @@ func (m *Manager) Routes() *http.ServeMux {
 
 // index resolves the {index} path value to a live engine, writing a 404/400 and
 // returning nil when it cannot.
-func (m *Manager) index(w http.ResponseWriter, r *http.Request) *engine.SearchEngine {
+func (m *Manager) index(w http.ResponseWriter, r *http.Request) engine.Index {
 	name := r.PathValue("index")
 	if !indexNamePattern.MatchString(name) {
 		jsonError(w, "invalid index name", http.StatusBadRequest)
 		return nil
 	}
 	m.mu.RLock()
-	se := m.indexes[name]
+	idx := m.indexes[name]
 	m.mu.RUnlock()
-	if se == nil {
+	if idx == nil {
 		jsonError(w, "index not found", http.StatusNotFound)
 		return nil
 	}
-	return se
-}
-
-// persist writes an index snapshot to disk, logging (but not failing the
-// request on) errors — the in-memory state is already updated.
-func (m *Manager) persist(se *engine.SearchEngine) {
-	if err := se.Save(filepath.Join(m.dataDir, se.Name())); err != nil {
-		log.Printf("manager: persist %q: %v", se.Name(), err)
-	}
+	return idx
 }
 
 // -------------------- indexes --------------------
 
 type createIndexReq struct {
 	Name                string  `json:"name"`
+	Kind                string  `json:"kind"` // "embedding" (default) or "llm"
 	CategoryThreshold   float64 `json:"category_threshold"`
 	MaxCategoriesPerDoc int     `json:"max_categories_per_doc"`
 	MaxCategories       int     `json:"max_categories"`
 	TopNCategories      int     `json:"top_n_categories"`
 	VarianceThreshold   float64 `json:"variance_threshold"`
 	VarianceMinCount    int     `json:"variance_min_count"`
+	DisableSplit        *bool   `json:"disable_split"`
+	MaxDocsPerCategory  int     `json:"max_docs_per_category"`
 }
 
 func (m *Manager) createIndex(w http.ResponseWriter, r *http.Request) {
@@ -158,6 +154,12 @@ func (m *Manager) createIndex(w http.ResponseWriter, r *http.Request) {
 	if req.VarianceMinCount > 0 {
 		cfg.VarianceMinCount = req.VarianceMinCount
 	}
+	if req.DisableSplit != nil {
+		cfg.DisableSplit = *req.DisableSplit
+	}
+	if req.MaxDocsPerCategory > 0 {
+		cfg.MaxDocsPerCategory = req.MaxDocsPerCategory
+	}
 
 	m.mu.Lock()
 	if _, exists := m.indexes[req.Name]; exists {
@@ -165,32 +167,35 @@ func (m *Manager) createIndex(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "index already exists", http.StatusConflict)
 		return
 	}
-	se := engine.New(req.Name, m.embedder, cfg)
-	m.indexes[req.Name] = se
+	idx, err := engine.New(engine.Kind(req.Kind), req.Name, m.deps, cfg)
+	if err != nil {
+		m.mu.Unlock()
+		jsonError(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	m.indexes[req.Name] = idx
 	m.mu.Unlock()
 
-	m.persist(se)
-	jsonResponse(w, map[string]any{"name": se.Name()}, http.StatusCreated)
+	jsonResponse(w, map[string]any{"name": idx.Name(), "kind": idx.Kind()}, http.StatusCreated)
 }
 
 func (m *Manager) listIndexes(w http.ResponseWriter, r *http.Request) {
 	m.mu.RLock()
-	names := make([]string, 0, len(m.indexes))
-	engines := make([]*engine.SearchEngine, 0, len(m.indexes))
-	for name, se := range m.indexes {
-		names = append(names, name)
-		engines = append(engines, se)
+	indexes := make([]engine.Index, 0, len(m.indexes))
+	for _, idx := range m.indexes {
+		indexes = append(indexes, idx)
 	}
 	m.mu.RUnlock()
 
 	type indexSummary struct {
 		Name          string `json:"name"`
+		Kind          string `json:"kind"`
 		DocCount      int    `json:"doc_count"`
 		CategoryCount int    `json:"category_count"`
 	}
-	summaries := make([]indexSummary, len(engines))
-	for i, se := range engines {
-		summaries[i] = indexSummary{Name: se.Name(), DocCount: se.DocCount(), CategoryCount: se.CategoryCount()}
+	summaries := make([]indexSummary, len(indexes))
+	for i, idx := range indexes {
+		summaries[i] = indexSummary{Name: idx.Name(), Kind: idx.Kind(), DocCount: idx.DocCount(), CategoryCount: idx.CategoryCount()}
 	}
 	sort.Slice(summaries, func(i, j int) bool { return summaries[i].Name < summaries[j].Name })
 	jsonResponse(w, map[string]any{"indexes": summaries, "total": len(summaries)}, http.StatusOK)
@@ -220,16 +225,16 @@ func (m *Manager) deleteIndex(w http.ResponseWriter, r *http.Request) {
 // demand. Document ingestion no longer persists after every write; callers
 // must invoke this endpoint to snapshot the index.
 func (m *Manager) persistIndex(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
-	if err := se.Save(filepath.Join(m.dataDir, se.Name())); err != nil {
-		log.Printf("manager: persist %q: %v", se.Name(), err)
+	if err := idx.Save(filepath.Join(m.dataDir, idx.Name())); err != nil {
+		log.Printf("manager: persist %q: %v", idx.Name(), err)
 		jsonError(w, "persist failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, map[string]any{"name": se.Name(), "persisted": true}, http.StatusOK)
+	jsonResponse(w, map[string]any{"name": idx.Name(), "persisted": true}, http.StatusOK)
 }
 
 // -------------------- documents --------------------
@@ -240,8 +245,8 @@ type documentReq struct {
 }
 
 func (m *Manager) createDocument(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
 	var req documentReq
@@ -256,11 +261,11 @@ func (m *Manager) createDocument(w http.ResponseWriter, r *http.Request) {
 	if req.ID == "" {
 		req.ID = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
-	if _, exists := se.GetDocument(req.ID); exists {
+	if _, exists := idx.GetDocument(req.ID); exists {
 		jsonError(w, "document already exists", http.StatusConflict)
 		return
 	}
-	doc, err := se.Process(r.Context(), req.ID, req.Content)
+	doc, err := idx.Process(r.Context(), req.ID, req.Content)
 	if err != nil {
 		log.Printf("handler: categorize %s: %v", req.ID, err)
 		jsonError(w, "categorization failed: "+err.Error(), http.StatusInternalServerError)
@@ -279,15 +284,15 @@ type batchError struct {
 }
 
 // batchDocuments ingests many documents in one request. Every document is
-// embedded and clustered in order. Ingestion no longer persists to disk;
-// call POST /indexes/{index}/persist once the batch is done. Individual
-// failures (empty content, embedding errors) are collected and reported
-// without aborting the rest of the batch. A document whose id already
-// exists is re-processed (its content and category memberships are
-// replaced), so a batch acts as an upsert.
+// categorized in order. Ingestion no longer persists to disk; call POST
+// /indexes/{index}/persist once the batch is done. Individual failures
+// (empty content, categorization errors) are collected and reported without
+// aborting the rest of the batch. A document whose id already exists is
+// re-processed (its content and category memberships are replaced), so a
+// batch acts as an upsert.
 func (m *Manager) batchDocuments(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
 	var req batchDocumentsReq
@@ -311,7 +316,7 @@ func (m *Manager) batchDocuments(w http.ResponseWriter, r *http.Request) {
 			errs = append(errs, batchError{ID: id, Error: "content is required"})
 			continue
 		}
-		if _, err := se.Process(r.Context(), id, d.Content); err != nil {
+		if _, err := idx.Process(r.Context(), id, d.Content); err != nil {
 			errs = append(errs, batchError{ID: id, Error: err.Error()})
 			continue
 		}
@@ -326,11 +331,11 @@ func (m *Manager) batchDocuments(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) getDocument(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
-	doc, ok := se.GetDocument(r.PathValue("id"))
+	doc, ok := idx.GetDocument(r.PathValue("id"))
 	if !ok {
 		jsonError(w, "document not found", http.StatusNotFound)
 		return
@@ -339,12 +344,12 @@ func (m *Manager) getDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) updateDocument(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
 	id := r.PathValue("id")
-	if _, ok := se.GetDocument(id); !ok {
+	if _, ok := idx.GetDocument(id); !ok {
 		jsonError(w, "document not found", http.StatusNotFound)
 		return
 	}
@@ -357,7 +362,7 @@ func (m *Manager) updateDocument(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "content is required", http.StatusBadRequest)
 		return
 	}
-	doc, err := se.Process(r.Context(), id, req.Content)
+	doc, err := idx.Process(r.Context(), id, req.Content)
 	if err != nil {
 		log.Printf("handler: updating doc %s: %v", id, err)
 		jsonError(w, "categorization failed: "+err.Error(), http.StatusInternalServerError)
@@ -367,11 +372,11 @@ func (m *Manager) updateDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 func (m *Manager) deleteDocument(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
-	if _, ok := se.Remove(r.PathValue("id")); !ok {
+	if _, ok := idx.Remove(r.PathValue("id")); !ok {
 		jsonError(w, "document not found", http.StatusNotFound)
 		return
 	}
@@ -381,51 +386,26 @@ func (m *Manager) deleteDocument(w http.ResponseWriter, r *http.Request) {
 // -------------------- categories --------------------
 
 func (m *Manager) listCategories(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
-	cats := se.ListCategories()
+	cats := idx.ListCategories()
 	sort.Slice(cats, func(i, j int) bool { return cats[i].Name < cats[j].Name })
-	type categorySummary struct {
-		Name        string    `json:"name"`
-		DocCount    int       `json:"doc_count"`
-		CreatedAt   time.Time `json:"created_at"`
-		Variance    float64   `json:"variance"`
-		ShouldSplit bool      `json:"should_split"`
-	}
-	summaries := make([]categorySummary, len(cats))
-	for i, c := range cats {
-		summaries[i] = categorySummary{
-			Name:        c.Name,
-			DocCount:    se.DocCountByCategory(c.Name),
-			CreatedAt:   c.CreatedAt,
-			Variance:    c.Variance,
-			ShouldSplit: c.ShouldSplit,
-		}
-	}
-	jsonResponse(w, summaries, http.StatusOK)
+	jsonResponse(w, cats, http.StatusOK)
 }
 
 func (m *Manager) getCategory(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
-	name := r.PathValue("name")
-	c, ok := se.GetCategory(name)
+	c, ok := idx.GetCategory(r.PathValue("name"))
 	if !ok {
 		jsonError(w, "category not found", http.StatusNotFound)
 		return
 	}
-	jsonResponse(w, map[string]any{
-		"name":         c.Name,
-		"doc_count":    se.DocCountByCategory(name),
-		"vector_dims":  len(c.Centroid),
-		"created_at":   c.CreatedAt,
-		"variance":     c.Variance,
-		"should_split": c.ShouldSplit,
-	}, http.StatusOK)
+	jsonResponse(w, c, http.StatusOK)
 }
 
 // -------------------- search --------------------
@@ -436,8 +416,8 @@ type searchReq struct {
 }
 
 func (m *Manager) search(w http.ResponseWriter, r *http.Request) {
-	se := m.index(w, r)
-	if se == nil {
+	idx := m.index(w, r)
+	if idx == nil {
 		return
 	}
 	var req searchReq
@@ -449,7 +429,7 @@ func (m *Manager) search(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, "q is required", http.StatusBadRequest)
 		return
 	}
-	results, err := se.Search(r.Context(), req.Q, req.Limit)
+	results, err := idx.Search(r.Context(), req.Q, req.Limit)
 	if err != nil {
 		log.Printf("handler: search error: %v", err)
 		jsonError(w, "search failed: "+err.Error(), http.StatusInternalServerError)

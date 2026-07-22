@@ -1,4 +1,4 @@
-package engine
+package common
 
 import (
 	"math/rand"
@@ -8,63 +8,63 @@ import (
 
 // verifyHeapInvariant checks the min-heap property: every parent's score is
 // <= both of its children's scores.
-func verifyHeapInvariant(t *testing.T, h []internalHit) {
+func verifyHeapInvariant(t *testing.T, h []InternalHit) {
 	t.Helper()
 	for i := range h {
 		left := 2*i + 1
 		right := 2*i + 2
-		if left < len(h) && h[i].score > h[left].score {
-			t.Fatalf("heap invariant broken at %d: parent %d > left child %d", i, h[i].score, h[left].score)
+		if left < len(h) && h[i].Score > h[left].Score {
+			t.Fatalf("heap invariant broken at %d: parent %d > left child %d", i, h[i].Score, h[left].Score)
 		}
-		if right < len(h) && h[i].score > h[right].score {
-			t.Fatalf("heap invariant broken at %d: parent %d > right child %d", i, h[i].score, h[right].score)
+		if right < len(h) && h[i].Score > h[right].Score {
+			t.Fatalf("heap invariant broken at %d: parent %d > right child %d", i, h[i].Score, h[right].Score)
 		}
 	}
 }
 
 func TestHeapPushHitMaintainsInvariant(t *testing.T) {
-	var h []internalHit
+	var h []InternalHit
 	scores := []int{5, 3, 8, 1, 9, 2, 7, 0, 6, 4}
 	for i, s := range scores {
-		h = heapPushHit(h, internalHit{id: uint32(i), score: s})
+		h = HeapPushHit(h, InternalHit{ID: uint32(i), Score: s})
 		verifyHeapInvariant(t, h)
 	}
 	if len(h) != len(scores) {
 		t.Fatalf("len = %d, want %d", len(h), len(scores))
 	}
 	// The root must be the minimum of everything pushed.
-	if h[0].score != 0 {
-		t.Fatalf("root score = %d, want 0 (the minimum)", h[0].score)
+	if h[0].Score != 0 {
+		t.Fatalf("root score = %d, want 0 (the minimum)", h[0].Score)
 	}
 }
 
 func TestHeapPushSingle(t *testing.T) {
-	h := heapPushHit(nil, internalHit{id: 42, score: 7})
-	if len(h) != 1 || h[0].id != 42 || h[0].score != 7 {
+	h := HeapPushHit(nil, InternalHit{ID: 42, Score: 7})
+	if len(h) != 1 || h[0].ID != 42 || h[0].Score != 7 {
 		t.Fatalf("single push = %+v", h)
 	}
 }
 
 func TestHeapReplaceTopMaintainsInvariant(t *testing.T) {
-	var h []internalHit
+	var h []InternalHit
 	for i, s := range []int{5, 3, 8, 1, 9} {
-		h = heapPushHit(h, internalHit{id: uint32(i), score: s})
+		h = HeapPushHit(h, InternalHit{ID: uint32(i), Score: s})
 	}
 	verifyHeapInvariant(t, h)
 
 	// Replacing the root (score 1) with something larger must re-establish the
 	// invariant and the new root must be the new minimum.
-	heapReplaceTop(h, internalHit{id: 99, score: 6})
+	HeapReplaceTop(h, InternalHit{ID: 99, Score: 6})
 	verifyHeapInvariant(t, h)
 	want := 3 // remaining scores: 5,3,8,9,6 -> min is 3
-	if h[0].score != want {
-		t.Fatalf("root after replace = %d, want %d", h[0].score, want)
+	if h[0].Score != want {
+		t.Fatalf("root after replace = %d, want %d", h[0].Score, want)
 	}
 
 	// Confirm the replaced value is actually present somewhere in the heap.
 	found := false
 	for _, hit := range h {
-		if hit.id == 99 && hit.score == 6 {
+		if hit.ID == 99 && hit.Score == 6 {
 			found = true
 		}
 	}
@@ -74,9 +74,9 @@ func TestHeapReplaceTopMaintainsInvariant(t *testing.T) {
 }
 
 func TestHeapReplaceTopSingleElement(t *testing.T) {
-	h := heapPushHit(nil, internalHit{id: 1, score: 5})
-	heapReplaceTop(h, internalHit{id: 2, score: 9})
-	if len(h) != 1 || h[0].id != 2 || h[0].score != 9 {
+	h := HeapPushHit(nil, InternalHit{ID: 1, Score: 5})
+	HeapReplaceTop(h, InternalHit{ID: 2, Score: 9})
+	if len(h) != 1 || h[0].ID != 2 || h[0].Score != 9 {
 		t.Fatalf("single-element replace = %+v", h)
 	}
 }
@@ -93,9 +93,9 @@ func TestHeapDrainProducesSortedOrder(t *testing.T) {
 		scores[i] = rng.Intn(1000)
 	}
 
-	var h []internalHit
+	var h []InternalHit
 	for i, s := range scores {
-		h = heapPushHit(h, internalHit{id: uint32(i), score: s})
+		h = HeapPushHit(h, InternalHit{ID: uint32(i), Score: s})
 		verifyHeapInvariant(t, h)
 	}
 
@@ -104,9 +104,9 @@ func TestHeapDrainProducesSortedOrder(t *testing.T) {
 		hit := h[0]
 		if i > 0 {
 			h[0] = h[i]
-			siftDownHit(h, 0, i)
+			SiftDownHit(h, 0, i)
 		}
-		drained[i] = hit.score
+		drained[i] = hit.Score
 	}
 
 	want := append([]int(nil), scores...)
@@ -131,19 +131,19 @@ func TestHeapBoundedTopK(t *testing.T) {
 		scores[i] = rng.Intn(10000)
 	}
 
-	var h []internalHit
+	var h []InternalHit
 	for i, s := range scores {
 		if len(h) < k {
-			h = heapPushHit(h, internalHit{id: uint32(i), score: s})
-		} else if h[0].score < s {
-			heapReplaceTop(h, internalHit{id: uint32(i), score: s})
+			h = HeapPushHit(h, InternalHit{ID: uint32(i), Score: s})
+		} else if h[0].Score < s {
+			HeapReplaceTop(h, InternalHit{ID: uint32(i), Score: s})
 		}
 		verifyHeapInvariant(t, h)
 	}
 
 	got := make([]int, len(h))
 	for i, hit := range h {
-		got[i] = hit.score
+		got[i] = hit.Score
 	}
 	sort.Ints(got)
 

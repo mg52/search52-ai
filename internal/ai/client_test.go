@@ -76,6 +76,21 @@ func TestEmbedRetriesThenSucceeds(t *testing.T) {
 	}
 }
 
+func TestEmbedDoesNotRetryPermanent4xx(t *testing.T) {
+	var calls int32
+	srv := embedServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		http.Error(w, "bad request", http.StatusBadRequest)
+	})
+	c := NewEmbeddingClient(srv.URL, "k", "m")
+	if _, err := c.Embed(context.Background(), "x"); err == nil {
+		t.Fatal("expected error for 400 response")
+	}
+	if calls != 1 {
+		t.Fatalf("calls = %d, want 1 (a 400 must not be retried)", calls)
+	}
+}
+
 func TestEmbedContextCancelled(t *testing.T) {
 	srv := embedServer(t, func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "boom", http.StatusInternalServerError)
@@ -102,5 +117,45 @@ func TestEmbedNoAuthHeaderWhenKeyEmpty(t *testing.T) {
 	}
 	if hadAuth {
 		t.Fatal("Authorization header should be omitted when apiKey is empty")
+	}
+}
+
+func chatServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("/chat/completions", handler)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestCompleteSuccess(t *testing.T) {
+	srv := chatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		if len(req.Messages) != 2 || req.Messages[0].Role != "system" || req.Messages[1].Role != "user" {
+			t.Errorf("unexpected messages: %+v", req.Messages)
+		}
+		json.NewEncoder(w).Encode(map[string]any{
+			"choices": []map[string]any{{"message": map[string]any{"content": "hello back"}}},
+		})
+	})
+	c := NewLLMClient(srv.URL, "secret", "m")
+	got, err := c.Complete(context.Background(), "sys", "usr")
+	if err != nil {
+		t.Fatalf("Complete: %v", err)
+	}
+	if got != "hello back" {
+		t.Errorf("Complete = %q, want %q", got, "hello back")
+	}
+}
+
+func TestCompleteEmptyChoices(t *testing.T) {
+	srv := chatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"choices": []any{}})
+	})
+	c := NewLLMClient(srv.URL, "k", "m")
+	if _, err := c.Complete(context.Background(), "sys", "usr"); err == nil {
+		t.Fatal("expected error for empty choices")
 	}
 }

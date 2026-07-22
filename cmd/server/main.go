@@ -18,13 +18,27 @@ func main() {
 
 	emb := ai.NewEmbeddingClient(cfg.EmbeddingBaseURL, cfg.EmbeddingAPIKey, cfg.EmbeddingModel)
 
-	mgr := handler.NewManager(cfg.DataDir, emb, engine.Config{
+	deps := engine.Deps{Embedder: emb}
+	if cfg.LLMBaseURL != "" {
+		deps.LLMClient = ai.NewLLMClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+		prompts, err := ai.LoadPrompts(cfg.PromptsDir)
+		if err != nil {
+			log.Fatalf("loading prompts from %s: %v", cfg.PromptsDir, err)
+		}
+		deps.Prompts = prompts
+	} else {
+		log.Printf("LLM_BASE_URL not set: the \"llm\" index kind is disabled")
+	}
+
+	mgr := handler.NewManager(cfg.DataDir, deps, engine.Config{
 		CategoryThreshold:   cfg.CategoryThreshold,
 		MaxCategoriesPerDoc: cfg.MaxCategoriesPerDoc,
 		MaxCategories:       cfg.MaxCategories,
 		TopNCategories:      cfg.TopNCategories,
 		VarianceThreshold:   cfg.VarianceThreshold,
 		VarianceMinCount:    cfg.VarianceMinCount,
+		DisableSplit:        cfg.DisableSplit,
+		MaxDocsPerCategory:  cfg.MaxDocsPerCategory,
 	})
 	if err := mgr.LoadExisting(); err != nil {
 		log.Fatalf("load indexes: %v", err)

@@ -1,4 +1,4 @@
-package engine
+package embedding
 
 import (
 	"bufio"
@@ -8,10 +8,12 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/mg52/search52-ai/internal/engine/common"
 )
 
-// snapshotFile is the single file each index directory holds.
-const snapshotFile = "index.gob"
+// SnapshotFile is the single file each embedding index directory holds.
+const SnapshotFile = "index.gob"
 
 // snapshot is the gob-serializable form of a SearchEngine. Centroid norms are
 // persisted alongside the centroids (not recomputed on load).
@@ -107,7 +109,7 @@ func (se *SearchEngine) Save(dir string) error {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return fmt.Errorf("mkdir %s: %w", dir, err)
 	}
-	file := filepath.Join(dir, snapshotFile)
+	file := filepath.Join(dir, SnapshotFile)
 	tmp := file + ".tmp"
 
 	f, err := os.Create(tmp)
@@ -132,8 +134,8 @@ func (se *SearchEngine) Save(dir string) error {
 
 // Load reconstructs a SearchEngine from dir/index.gob and attaches embedder
 // (embedders are not persisted). It returns an error if the snapshot is absent.
-func Load(dir string, embedder Embedder) (*SearchEngine, error) {
-	file := filepath.Join(dir, snapshotFile)
+func Load(dir string, embedder common.Embedder) (*SearchEngine, error) {
+	file := filepath.Join(dir, SnapshotFile)
 	f, err := os.Open(file)
 	if err != nil {
 		return nil, err

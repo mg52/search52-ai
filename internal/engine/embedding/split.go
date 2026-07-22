@@ -8,7 +8,7 @@
 // between the snapshot and the merge — docs added, removed, or reassigned
 // elsewhere by a concurrent Process/Remove — is reconciled against live state
 // at merge time, never against the stale snapshot.
-package engine
+package embedding
 
 import "github.com/mg52/search52-ai/internal/vec"
 

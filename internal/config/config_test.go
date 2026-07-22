@@ -45,6 +45,46 @@ func TestLoadDefaults(t *testing.T) {
 	if c.MaxCategoriesPerDoc != 3 || c.MaxCategories != 100 || c.TopNCategories != 3 {
 		t.Errorf("category defaults wrong: %+v", c)
 	}
+	if c.MaxDocsPerCategory != 50 {
+		t.Errorf("MaxDocsPerCategory = %d, want 50", c.MaxDocsPerCategory)
+	}
+	if c.PromptsDir != "./prompts" {
+		t.Errorf("PromptsDir = %q, want ./prompts", c.PromptsDir)
+	}
+}
+
+func TestLoadLLMConfigOptional(t *testing.T) {
+	setRequired(t)
+	for _, k := range []string{"LLM_BASE_URL", "LLM_API_KEY", "LLM_MODEL"} {
+		t.Setenv(k, "")
+	}
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("LLM env vars should be optional: %v", err)
+	}
+	if c.LLMBaseURL != "" || c.LLMAPIKey != "" || c.LLMModel != "" {
+		t.Errorf("expected empty LLM config, got %+v", c)
+	}
+}
+
+func TestLoadLLMConfigOverrides(t *testing.T) {
+	setRequired(t)
+	t.Setenv("LLM_BASE_URL", "http://llm")
+	t.Setenv("LLM_API_KEY", "k")
+	t.Setenv("LLM_MODEL", "gpt")
+	t.Setenv("PROMPTS_DIR", "/tmp/prompts")
+	t.Setenv("MAX_DOCS_PER_CATEGORY", "25")
+
+	c, err := Load()
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if c.LLMBaseURL != "http://llm" || c.LLMAPIKey != "k" || c.LLMModel != "gpt" {
+		t.Errorf("LLM overrides not applied: %+v", c)
+	}
+	if c.PromptsDir != "/tmp/prompts" || c.MaxDocsPerCategory != 25 {
+		t.Errorf("overrides not applied: %+v", c)
+	}
 }
 
 func TestLoadOverrides(t *testing.T) {

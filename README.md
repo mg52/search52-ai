@@ -1,15 +1,27 @@
 # search52-ai
 
 A semantic search service that **automatically clusters documents into categories**
-by vector similarity and retrieves them via embedding search. No LLM involved —
-only an embedding model. Compatible with any OpenAI-compatible embeddings API
-(Ollama, OpenAI, etc.).
+and retrieves them via similarity search. Two index kinds, chosen per index at
+creation time via `"kind"`:
+
+- **`embedding`** (default) — categories are cosine-similarity clusters over an
+  embedding model. No LLM involved.
+- **`llm`** — categories are decided by an LLM chat call against a fixed prompt
+  (reusing an existing category name or founding a new one). Each category then
+  gets a one-time, async LLM-generated description, which is embedded together
+  with the category name and example documents so search can still rank
+  categories by cosine similarity — only categories are embedded, not individual
+  documents.
+
+Both kinds are compatible with any OpenAI-compatible embeddings API (Ollama,
+OpenAI, etc.); the `llm` kind additionally needs an OpenAI-compatible chat
+endpoint.
 
 Documents live in named **indexes**, each an independent engine with its own
 documents, categories, and tuning. Create as many as you need under one server
-(e.g. `products`, `tickets`, `docs`).
+(e.g. `products`, `tickets`, `docs`), mixing `embedding` and `llm` indexes freely.
 
-## How it works
+## How it works — `embedding` index
 
 **Embed** (`POST /indexes/{index}/documents`) — content is embedded once into a
 dense vector.
@@ -31,12 +43,30 @@ the query, with similarity).
 members' similarity to the centroid, using [Welford's online
 algorithm](https://en.wikipedia.org/wiki/Algorithms_for_calculating_variance#Welford's_online_algorithm).
 Once that variance exceeds `VARIANCE_THRESHOLD` and the category has more than
-`VARIANCE_MIN_COUNT` members, its `ShouldSplit` flag flips true. This is a
-signal only — nothing currently splits a flagged category.
+`VARIANCE_MIN_COUNT` members, the category is asynchronously re-clustered into
+two (`DISABLE_SPLIT=true` turns this off).
+
+## How it works — `llm` index
+
+**Categorize** (`POST /indexes/{index}/documents`) — content, plus the list of
+existing category names, is sent to the LLM with a fixed prompt; it replies
+with 1–`MAX_CATEGORIES_PER_DOC` category names, reusing existing ones where it
+can. No embedding call happens per document.
+
+**Category profile** — the first time a category name is used, a background
+call asks the LLM for a dense description from up to 10 of the category's
+example documents, then embeds `name + description + examples` together. Until
+that lands, the category has no vector and is invisible to search.
+
+**Search** (`POST /indexes/{index}/search`) — the query is embedded and
+compared to category embeddings (not document embeddings); the `TOP_N_CATEGORIES`
+nearest categories are selected, and up to `MAX_DOCS_PER_CATEGORY` member
+documents from each are returned (deduped, capped by the request's `limit`).
 
 ## Quickstart
 
-Requires an OpenAI-compatible embedding endpoint (e.g. Ollama). No LLM needed.
+Requires an OpenAI-compatible embedding endpoint (e.g. Ollama). The `llm` index
+kind is only enabled when `LLM_BASE_URL` is also set.
 
 ```bash
 EMBEDDING_BASE_URL=http://localhost:11434/v1 \
@@ -96,14 +126,20 @@ to wipe them).
 | `EMBEDDING_BASE_URL`     | required  | Base URL for the embedding model (OpenAI-compatible) |
 | `EMBEDDING_MODEL`        | required  | Embedding model name                                 |
 | `EMBEDDING_API_KEY`      | optional  | API key (`ollama` locally; omit if unauthenticated)  |
+| `LLM_BASE_URL`           | optional  | Base URL for an OpenAI-compatible chat endpoint; unset disables the `llm` index kind |
+| `LLM_MODEL`              | optional  | Chat model name (required if `LLM_BASE_URL` is set) |
+| `LLM_API_KEY`            | optional  | API key for the chat endpoint                        |
+| `PROMPTS_DIR`            | `./prompts` | Directory holding the `llm` index's fixed prompt templates |
 | `PORT`                   | `8080`    | HTTP port                                            |
 | `DATA_DIR`               | `./data`  | Directory holding one snapshot subdir per index      |
-| `CATEGORY_THRESHOLD`     | `0.60`    | Min cosine similarity to join an existing category   |
+| `CATEGORY_THRESHOLD`     | `0.60`    | *(embedding)* Min cosine similarity to join an existing category |
 | `MAX_CATEGORIES_PER_DOC` | `3`       | Max categories a single document may join            |
 | `MAX_CATEGORIES`         | `100`     | Cap on the total number of categories                |
 | `TOP_N_CATEGORIES`       | `3`       | Nearest categories scanned per query                 |
-| `VARIANCE_THRESHOLD`     | `0.02`    | Variance above which a category's `ShouldSplit` flips true |
-| `VARIANCE_MIN_COUNT`     | `100`     | Min category member count before `ShouldSplit` can fire |
+| `VARIANCE_THRESHOLD`     | `0.02`    | *(embedding)* Variance above which a category's `ShouldSplit` flips true |
+| `VARIANCE_MIN_COUNT`     | `100`     | *(embedding)* Min category member count before `ShouldSplit` can fire |
+| `DISABLE_SPLIT`          | `false`   | *(embedding)* Turn off automatic category splitting  |
+| `MAX_DOCS_PER_CATEGORY`  | `50`      | *(llm)* Docs returned per matched category in search  |
 
 These set the **defaults** for new indexes; any can be overridden per index in
 the `POST /indexes` request body.
@@ -115,8 +151,8 @@ All document, category, and search operations are scoped to an index at
 
 | Method | Path                                   | Description                                       |
 |--------|----------------------------------------|---------------------------------------------------|
-| POST   | `/indexes`                             | Create an index (optional per-index tuning)       |
-| GET    | `/indexes`                             | List indexes with document/category counts        |
+| POST   | `/indexes`                             | Create an index (`kind`: `embedding`\|`llm`, optional per-index tuning) |
+| GET    | `/indexes`                             | List indexes with kind, document/category counts  |
 | DELETE | `/indexes/{index}`                     | Delete an index and its on-disk snapshot          |
 | POST   | `/indexes/{index}/documents`           | Embed and categorize a document                   |
 | POST   | `/indexes/{index}/documents/batch`     | Bulk-index many documents (upsert by id)          |
@@ -129,17 +165,24 @@ All document, category, and search operations are scoped to an index at
 | POST   | `/indexes/{index}/search`              | Semantic search                                   |
 | GET    | `/health`                              | Service status (index count)                      |
 
-`GET /indexes/{index}/categories[/{name}]` includes each category's `variance`
-and `should_split`; the detail endpoint also reports `vector_dims`:
+`GET /indexes/{index}/categories[/{name}]` reports fields relevant to the
+index's kind: `embedding` categories include `variance`/`should_split`, `llm`
+categories include `description`; both report `vector_dims` once a vector
+exists (0 for an `llm` category whose async profile hasn't landed yet).
 ```json
 { "name": "category1", "doc_count": 42, "vector_dims": 768, "created_at": "...", "variance": 0.0113, "should_split": false }
+{ "name": "audio_devices", "doc_count": 12, "vector_dims": 768, "created_at": "...", "description": "Wireless and wired audio hardware..." }
 ```
 
-**Create an index** (tuning fields are optional; omit to inherit server defaults)
+**Create an index** (`kind` is `"embedding"` if omitted; tuning fields are optional)
 ```bash
 curl -X POST http://localhost:8080/indexes \
   -H "Content-Type: application/json" \
-  -d '{"name": "products", "category_threshold": 0.6, "max_categories_per_doc": 3, "max_categories": 100, "top_n_categories": 3, "variance_threshold": 0.02, "variance_min_count": 100}'
+  -d '{"name": "products", "kind": "embedding", "category_threshold": 0.6, "max_categories_per_doc": 3, "max_categories": 100, "top_n_categories": 3, "variance_threshold": 0.02, "variance_min_count": 100}'
+
+curl -X POST http://localhost:8080/indexes \
+  -H "Content-Type: application/json" \
+  -d '{"name": "support-tickets", "kind": "llm", "max_categories_per_doc": 2, "max_docs_per_category": 50}'
 ```
 
 **Index a document** (`id` is optional; a timestamp id is generated when omitted)

@@ -7,9 +7,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"github.com/mg52/search52-ai/internal/ai"
 	"github.com/mg52/search52-ai/internal/engine"
 )
 
@@ -35,7 +39,55 @@ func (fakeEmbedder) Embed(_ context.Context, text string) ([]float32, error) {
 
 func newStack(t *testing.T) *httptest.Server {
 	t.Helper()
-	mgr := NewManager(t.TempDir(), fakeEmbedder{}, engine.Config{
+	mgr := NewManager(t.TempDir(), engine.Deps{Embedder: fakeEmbedder{}}, engine.Config{
+		CategoryThreshold: 0.6, MaxCategoriesPerDoc: 3, MaxCategories: 10, TopNCategories: 3,
+	})
+	srv := httptest.NewServer(mgr.Routes())
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+// fakeChatter always assigns/founds category "c" and returns a fixed
+// description, so llm-kind index tests don't need a real LLM endpoint.
+type fakeChatter struct{}
+
+func (fakeChatter) Complete(_ context.Context, _, user string) (string, error) {
+	if strings.Contains(user, "Document:") {
+		return `{"categories":["c"]}`, nil
+	}
+	return `{"description":"placeholder description"}`, nil
+}
+
+func testPrompts(t *testing.T) *ai.Prompts {
+	t.Helper()
+	dir := t.TempDir()
+	files := map[string]string{
+		"tagging_system.template":     "sys max={{.MaxCategories}}",
+		"tagging_user.template":       "existing={{.ExistingCategories}} Document: {{.Content}}",
+		"description_system.template": "sys",
+		"description_user.template":   "Category: {{.CategoryName}} Example documents: {{.Examples}}",
+	}
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	p, err := ai.LoadPrompts(dir)
+	if err != nil {
+		t.Fatalf("LoadPrompts: %v", err)
+	}
+	return p
+}
+
+// newStackWithLLM is like newStack but also wires an LLM client + prompts,
+// so it supports creating kind:"llm" indexes.
+func newStackWithLLM(t *testing.T) *httptest.Server {
+	t.Helper()
+	mgr := NewManager(t.TempDir(), engine.Deps{
+		Embedder:  fakeEmbedder{},
+		LLMClient: fakeChatter{},
+		Prompts:   testPrompts(t),
+	}, engine.Config{
 		CategoryThreshold: 0.6, MaxCategoriesPerDoc: 3, MaxCategories: 10, TopNCategories: 3,
 	})
 	srv := httptest.NewServer(mgr.Routes())
@@ -131,14 +183,15 @@ func TestSearchRanksAndSeparatesDomains(t *testing.T) {
 
 func TestPersistenceRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	mgr := NewManager(dir, fakeEmbedder{}, engine.Config{CategoryThreshold: 0.6, MaxCategoriesPerDoc: 3, MaxCategories: 10, TopNCategories: 3})
+	mgr := NewManager(dir, engine.Deps{Embedder: fakeEmbedder{}}, engine.Config{CategoryThreshold: 0.6, MaxCategoriesPerDoc: 3, MaxCategories: 10, TopNCategories: 3})
 	srv := httptest.NewServer(mgr.Routes())
 	do(t, srv, "POST", "/indexes", `{"name":"products"}`)
 	do(t, srv, "POST", "/indexes/products/documents", `{"id":"d1","content":"sony wireless headphones"}`)
+	do(t, srv, "POST", "/indexes/products/persist", "")
 	srv.Close()
 
 	// Fresh manager over the same dir should reload the index and its document.
-	mgr2 := NewManager(dir, fakeEmbedder{}, engine.Config{})
+	mgr2 := NewManager(dir, engine.Deps{Embedder: fakeEmbedder{}}, engine.Config{})
 	if err := mgr2.LoadExisting(); err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -377,7 +430,7 @@ func TestHealthReportsIndexCount(t *testing.T) {
 
 func TestBatchDocuments(t *testing.T) {
 	dir := t.TempDir()
-	mgr := NewManager(dir, fakeEmbedder{}, engine.Config{
+	mgr := NewManager(dir, engine.Deps{Embedder: fakeEmbedder{}}, engine.Config{
 		CategoryThreshold: 0.6, MaxCategoriesPerDoc: 3, MaxCategories: 10, TopNCategories: 3,
 	})
 	srv := httptest.NewServer(mgr.Routes())
@@ -399,11 +452,12 @@ func TestBatchDocuments(t *testing.T) {
 	if resp["failed"].(float64) != 1 {
 		t.Fatalf("failed = %v, want 1", resp["failed"])
 	}
+	do(t, srv, "POST", "/indexes/bulk/persist", "")
 	srv.Close()
 
-	// The single end-of-batch persist must have written every indexed doc: a
-	// fresh manager over the same dir reloads them.
-	mgr2 := NewManager(dir, fakeEmbedder{}, engine.Config{})
+	// The explicit persist call must have written every indexed doc: a fresh
+	// manager over the same dir reloads them.
+	mgr2 := NewManager(dir, engine.Deps{Embedder: fakeEmbedder{}}, engine.Config{})
 	if err := mgr2.LoadExisting(); err != nil {
 		t.Fatalf("reload: %v", err)
 	}
@@ -450,5 +504,80 @@ func TestPerIndexConfigOverride(t *testing.T) {
 	cats, _ := body["categories"].([]any)
 	if len(cats) != 1 {
 		t.Fatalf("max_categories_per_doc=1 should assign exactly 1 category, got %d: %v", len(cats), cats)
+	}
+}
+
+func TestCreateLLMIndexRequiresDeps(t *testing.T) {
+	srv := newStack(t) // no LLM client wired up
+	code, body := do(t, srv, "POST", "/indexes", `{"name":"i","kind":"llm"}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("expected 400 creating an llm index without LLM deps, got %d (%v)", code, body)
+	}
+}
+
+func TestLLMIndexEndToEnd(t *testing.T) {
+	srv := newStackWithLLM(t)
+
+	code, body := do(t, srv, "POST", "/indexes", `{"name":"i","kind":"llm"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create llm index: got %d (%v)", code, body)
+	}
+	if body["kind"] != "llm" {
+		t.Fatalf("expected kind=llm in create response, got %v", body["kind"])
+	}
+
+	code, body = do(t, srv, "POST", "/indexes/i/documents", `{"id":"d1","content":"sony wireless headphones audio"}`)
+	if code != http.StatusCreated {
+		t.Fatalf("create doc: got %d (%v)", code, body)
+	}
+	cats, _ := body["categories"].([]any)
+	if len(cats) != 1 || cats[0] != "c" {
+		t.Fatalf("expected category [c] from the fake LLM, got %v", body["categories"])
+	}
+
+	// Category profile generation (description + embedding) is async.
+	deadline := time.Now().Add(time.Second)
+	var catBody map[string]any
+	for time.Now().Before(deadline) {
+		var ccode int
+		ccode, catBody = do(t, srv, "GET", "/indexes/i/categories/c", "")
+		if ccode == http.StatusOK {
+			if dims, ok := catBody["vector_dims"].(float64); ok && dims > 0 {
+				break
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if dims, _ := catBody["vector_dims"].(float64); dims == 0 {
+		t.Fatalf("expected category c to have a non-zero vector_dims after profile generation, got %v", catBody)
+	}
+	if desc, _ := catBody["description"].(string); desc == "" {
+		t.Fatalf("expected a non-empty description, got %v", catBody)
+	}
+
+	code, body = do(t, srv, "POST", "/indexes/i/search", `{"q":"sony wireless headphones","limit":5}`)
+	if code != http.StatusOK {
+		t.Fatalf("search: got %d (%v)", code, body)
+	}
+	results, _ := body["documents"].([]any)
+	if len(results) == 0 {
+		t.Fatalf("expected at least one search hit, got %v", body)
+	}
+}
+
+func TestListIndexesReportsKind(t *testing.T) {
+	srv := newStackWithLLM(t)
+	do(t, srv, "POST", "/indexes", `{"name":"e"}`)
+	do(t, srv, "POST", "/indexes", `{"name":"l","kind":"llm"}`)
+
+	_, body := do(t, srv, "GET", "/indexes", "")
+	indexes := body["indexes"].([]any)
+	kinds := map[string]string{}
+	for _, raw := range indexes {
+		idx := raw.(map[string]any)
+		kinds[idx["name"].(string)] = idx["kind"].(string)
+	}
+	if kinds["e"] != "embedding" || kinds["l"] != "llm" {
+		t.Fatalf("expected kinds e=embedding l=llm, got %v", kinds)
 	}
 }

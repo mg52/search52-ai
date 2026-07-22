@@ -1,4 +1,4 @@
-package engine
+package embedding
 
 import (
 	"context"
@@ -124,7 +124,7 @@ func TestMergeSplitLockedReplacesCategoryAndMigratesMembers(t *testing.T) {
 	total := 0
 	for _, cat := range cats {
 		total += se.DocCountByCategory(cat.Name)
-		if cat.Centroid == nil || cat.Norm == 0 {
+		if cat.VectorDims == 0 {
 			t.Fatalf("category %s missing a real centroid", cat.Name)
 		}
 	}
@@ -241,8 +241,8 @@ func TestMergeSplitLockedPrunesEmptySide(t *testing.T) {
 	if len(cats) != 1 {
 		t.Fatalf("expected the empty side to be pruned, leaving exactly 1 category, got %d", len(cats))
 	}
-	if cats[0].Count != 1 {
-		t.Fatalf("surviving category should have 1 member, got %d", cats[0].Count)
+	if cats[0].DocCount != 1 {
+		t.Fatalf("surviving category should have 1 member, got %d", cats[0].DocCount)
 	}
 }
 
@@ -286,7 +286,7 @@ func TestSplitCategoryBailsEarlyAtCap(t *testing.T) {
 	if !ok {
 		t.Fatal("category c should survive a cap-refused split")
 	}
-	if !c.ShouldSplit {
+	if c.ShouldSplit == nil || !*c.ShouldSplit {
 		t.Fatal("ShouldSplit must stay set so the split can retry when the cap frees up")
 	}
 	if se.CategoryCount() != 1 {
@@ -361,7 +361,7 @@ func TestProcessTriggersAsyncSplitEndToEnd(t *testing.T) {
 			return false
 		}
 		for _, c := range se.ListCategories() {
-			if c.ShouldSplit {
+			if c.ShouldSplit != nil && *c.ShouldSplit {
 				return false // a cascading split is still pending/running
 			}
 		}
@@ -451,7 +451,7 @@ func TestProcessDoesNotDuplicateInFlightSplit(t *testing.T) {
 	if !ok {
 		t.Fatalf("category %q should still exist (gated split must not have run)", catName)
 	}
-	if !cat.ShouldSplit {
+	if cat.ShouldSplit == nil || !*cat.ShouldSplit {
 		t.Fatalf("expected ShouldSplit to have flipped true")
 	}
 
