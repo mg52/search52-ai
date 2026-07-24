@@ -84,6 +84,10 @@ func NewLLMClient(baseURL, apiKey, model string) *LLMClient {
 type chatRequest struct {
 	Model    string        `json:"model"`
 	Messages []chatMessage `json:"messages"`
+	// ReasoningEffort disables chain-of-thought output on reasoning models
+	// (OpenAI o-series, Qwen3/3.5 via Ollama). This index's prompts are fixed
+	// classification tasks — reasoning tokens only add latency, not quality.
+	ReasoningEffort string `json:"reasoning_effort"`
 }
 
 type chatMessage struct {
@@ -108,6 +112,7 @@ func (c *LLMClient) Complete(ctx context.Context, system, user string) (string, 
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
+		ReasoningEffort: "none",
 	}
 	var resp chatResponse
 	err := retry(ctx, 3, func() error {
