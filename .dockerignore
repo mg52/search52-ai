@@ -9,7 +9,6 @@ Dockerfile
 
 # Docs & local notes
 *.md
-TEST.txt
 
 # Tests aren't needed to build the server binary
 **/*_test.go

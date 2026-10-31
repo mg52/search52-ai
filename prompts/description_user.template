@@ -1,5 +1,0 @@
-Category: {{.CategoryName}}
-Example documents:
-{{.Examples}}
-
-Reply with ONLY: {"description": "..."}

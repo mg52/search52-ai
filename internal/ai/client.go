@@ -12,54 +12,6 @@ import (
 	"time"
 )
 
-// EmbeddingClient calls an OpenAI-compatible /embeddings endpoint. The same
-// endpoint is exposed by OpenAI and by Ollama's OpenAI-compatible API (base URL
-// typically ".../v1").
-type EmbeddingClient struct {
-	baseURL string
-	apiKey  string
-	model   string
-	http    *http.Client
-}
-
-func NewEmbeddingClient(baseURL, apiKey, model string) *EmbeddingClient {
-	return &EmbeddingClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		model:   model,
-		http:    &http.Client{Timeout: 60 * time.Second},
-	}
-}
-
-type embeddingRequest struct {
-	Input string `json:"input"`
-	Model string `json:"model"`
-}
-
-type embeddingResponse struct {
-	Data []struct {
-		Embedding []float32 `json:"embedding"`
-	} `json:"data"`
-}
-
-// Embed returns the embedding vector for text, retrying transient failures with
-// exponential backoff. Vectors are float32 end-to-end: embedding similarities
-// don't need float64 precision and the smaller footprint halves scan bandwidth.
-func (c *EmbeddingClient) Embed(ctx context.Context, text string) ([]float32, error) {
-	req := embeddingRequest{Input: text, Model: c.model}
-	var resp embeddingResponse
-	err := retry(ctx, 3, func() error {
-		return postJSON(ctx, c.http, c.baseURL+"/embeddings", c.apiKey, req, &resp)
-	})
-	if err != nil {
-		return nil, err
-	}
-	if len(resp.Data) == 0 {
-		return nil, fmt.Errorf("empty data in embedding response")
-	}
-	return resp.Data[0].Embedding, nil
-}
-
 // LLMClient calls an OpenAI-compatible /chat/completions endpoint.
 type LLMClient struct {
 	baseURL string
