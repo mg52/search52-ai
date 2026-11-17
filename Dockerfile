@@ -31,6 +31,8 @@ WORKDIR /app
 COPY --from=build /out/server /app/server
 
 ENV PORT=8080
+# Required at run time: LLM_BASE_URL, LLM_MODEL (optional: LLM_API_KEY), e.g.
+#   docker run -p 8080:8080 -e LLM_BASE_URL=... -e LLM_MODEL=... search52-ai
 
 EXPOSE 8080
 USER nonroot:nonroot

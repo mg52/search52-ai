@@ -10,8 +10,8 @@ import (
 func TestComplete(t *testing.T) {
 	m := New()
 	tests := []struct{ text, want string }{
-		{"Bose earbuds with noise cancelling", `{"labels":["audio","sound","earphones","noise cancelling"]}`},
-		{"QUANTUM PHYSICS", `{"labels":[]}`},
+		{"Bose earbuds with noise cancelling", "audio, sound, earphones, noise cancelling"},
+		{"QUANTUM PHYSICS", ""},
 	}
 	for _, tc := range tests {
 		got, err := m.Complete(context.Background(), "ignored", tc.text)
@@ -25,11 +25,11 @@ func TestServerWorksWithRealClient(t *testing.T) {
 	srv := NewServer(New())
 	defer srv.Close()
 
-	got, err := ai.NewLLMClient(srv.URL, "", "mock").Complete(context.Background(), ai.LabelsSystemPrompt, "garden hose")
+	got, err := ai.NewLLMClient(srv.URL, "", "mock").Complete(context.Background(), ai.SearchPrompt(nil, 5, 10), "garden hose")
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}
-	if want := `{"labels":["gardening","outdoor","hose"]}`; got != want {
+	if want := "gardening, outdoor, hose"; got != want {
 		t.Errorf("got %q, want %q", got, want)
 	}
 }

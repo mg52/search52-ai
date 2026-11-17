@@ -5,7 +5,6 @@ package index
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
 	"sort"
 	"strings"
@@ -25,17 +24,33 @@ type Document struct {
 	Labels  []string `json:"labels,omitempty"`
 }
 
+// Result is a search hit: a document and its score, the number of the query's
+// labels the document has.
+type Result struct {
+	Document
+	Score int `json:"score"`
+}
+
+// Options tunes how the LLM is prompted.
+type Options struct {
+	MaxPromptLabels int // most existing labels shown to the LLM per call; <= 0 means all
+	MinLabels       int // fewest labels the LLM is asked for
+	MaxLabels       int // most labels the LLM is asked for; extras are dropped, <= 0 means no cap
+}
+
 type Index struct {
-	llm Chatter
+	llm  Chatter
+	opts Options
 
 	mu      sync.RWMutex
 	docs    map[string]Document            // id -> document with its labels
 	byLabel map[string]map[string]struct{} // label -> document ids
 }
 
-func New(llm Chatter) *Index {
+func New(llm Chatter, opts Options) *Index {
 	return &Index{
 		llm:     llm,
+		opts:    opts,
 		docs:    make(map[string]Document),
 		byLabel: make(map[string]map[string]struct{}),
 	}
@@ -44,7 +59,7 @@ func New(llm Chatter) *Index {
 // Add labels content with the LLM and stores it under id, replacing any
 // existing document with that id.
 func (idx *Index) Add(ctx context.Context, id, content string) (Document, error) {
-	labels, err := idx.labels(ctx, content)
+	labels, err := idx.labels(ctx, ai.IndexPrompt, content)
 	if err != nil {
 		return Document{}, err
 	}
@@ -83,9 +98,10 @@ func (idx *Index) removeLocked(id string) {
 }
 
 // Search labels query with the LLM and returns the documents sharing at least
-// one label with it, most shared labels first, plus the query's labels.
-func (idx *Index) Search(ctx context.Context, query string) ([]Document, []string, error) {
-	labels, err := idx.labels(ctx, query)
+// one label with it, plus the query's labels. A document's score is how many
+// of the query's labels it has; results are ordered by score, then id.
+func (idx *Index) Search(ctx context.Context, query string) ([]Result, []string, error) {
+	labels, err := idx.labels(ctx, ai.SearchPrompt, query)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -97,59 +113,74 @@ func (idx *Index) Search(ctx context.Context, query string) ([]Document, []strin
 			shared[id]++
 		}
 	}
-	docs := make([]Document, 0, len(shared))
-	for id := range shared {
-		docs = append(docs, idx.docs[id])
+	results := make([]Result, 0, len(shared))
+	for id, score := range shared {
+		results = append(results, Result{Document: idx.docs[id], Score: score})
 	}
 	idx.mu.RUnlock()
 
-	sort.Slice(docs, func(i, j int) bool {
-		a, b := docs[i], docs[j]
-		if shared[a.ID] != shared[b.ID] {
-			return shared[a.ID] > shared[b.ID]
+	sort.Slice(results, func(i, j int) bool {
+		a, b := results[i], results[j]
+		if a.Score != b.Score {
+			return a.Score > b.Score
 		}
 		return a.ID < b.ID
 	})
-	return docs, labels, nil
+	return results, labels, nil
 }
 
-func (idx *Index) labels(ctx context.Context, text string) ([]string, error) {
-	raw, err := idx.llm.Complete(ctx, ai.LabelsSystemPrompt, text)
+// labels asks the LLM for labels of text under the given prompt builder, which
+// is shown the labels the index already has.
+func (idx *Index) labels(ctx context.Context, prompt func([]string, int, int) string, text string) ([]string, error) {
+	raw, err := idx.llm.Complete(ctx, prompt(idx.existingLabels(), idx.opts.MinLabels, idx.opts.MaxLabels), text)
 	if err != nil {
 		return nil, err
 	}
-	var resp struct {
-		Labels []string `json:"labels"`
-	}
-	if err := json.Unmarshal([]byte(extractJSON(raw)), &resp); err != nil {
-		return nil, fmt.Errorf("parsing LLM labels %q: %w", raw, err)
-	}
-	labels := cleanLabels(resp.Labels)
+	labels := parseLabels(raw)
 	if len(labels) == 0 {
-		return nil, fmt.Errorf("LLM returned no labels")
+		return nil, fmt.Errorf("LLM returned no labels: %q", raw)
+	}
+	if max := idx.opts.MaxLabels; max > 0 && len(labels) > max {
+		labels = labels[:max]
 	}
 	return labels, nil
 }
 
-// extractJSON pulls the first {...} object out of s, stripping markdown code
-// fences and any trailing model-specific tokens.
-func extractJSON(s string) string {
-	start := strings.Index(s, "{")
-	end := strings.LastIndex(s, "}")
-	if start != -1 && end != -1 && end >= start {
-		return s[start : end+1]
+// existingLabels returns the labels in the index for the prompt: most used
+// first (ties by name), capped at Options.MaxPromptLabels.
+func (idx *Index) existingLabels() []string {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	out := make([]string, 0, len(idx.byLabel))
+	for l := range idx.byLabel {
+		out = append(out, l)
 	}
-	return strings.TrimSpace(s)
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if na, nb := len(idx.byLabel[a]), len(idx.byLabel[b]); na != nb {
+			return na > nb
+		}
+		return a < b
+	})
+	if idx.opts.MaxPromptLabels > 0 && len(out) > idx.opts.MaxPromptLabels {
+		out = out[:idx.opts.MaxPromptLabels]
+	}
+	return out
 }
 
-// cleanLabels trims whitespace, lowercases, drops blank entries, and removes
-// duplicates while preserving order — guarding against models that emit junk
-// like [""] or repeats.
-func cleanLabels(raw []string) []string {
-	seen := make(map[string]struct{}, len(raw))
-	out := make([]string, 0, len(raw))
-	for _, l := range raw {
-		l = strings.TrimSpace(strings.ToLower(l))
+// parseLabels reads "label1, label2" (newlines also separate) into trimmed,
+// lowercased, de-duplicated labels, tolerating the junk models add around
+// them: code fences, quotes, bullets, trailing periods and blank entries.
+func parseLabels(raw string) []string {
+	fields := strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == '\n' })
+	seen := make(map[string]struct{}, len(fields))
+	out := make([]string, 0, len(fields))
+	for _, l := range fields {
+		l = strings.ToLower(strings.TrimSpace(l))
+		if strings.HasPrefix(l, "```") {
+			continue // a fence line such as ``` or ```text
+		}
+		l = strings.Trim(l, " \t\r-*•\"'`.") // bullets, quotes, trailing period
 		if _, dup := seen[l]; l == "" || dup {
 			continue
 		}

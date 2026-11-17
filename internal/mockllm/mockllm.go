@@ -54,7 +54,7 @@ type LLM struct {
 
 func New() *LLM { return &LLM{Rules: DefaultRules} }
 
-// Complete ignores the system prompt and answers {"labels": [...]} for user.
+// Complete ignores the system prompt and answers "label1, label2" for user.
 func (m *LLM) Complete(_ context.Context, _, user string) (string, error) {
 	text := strings.ToLower(user)
 	labels := []string{}
@@ -66,8 +66,7 @@ func (m *LLM) Complete(_ context.Context, _, user string) (string, error) {
 			}
 		}
 	}
-	out, err := json.Marshal(map[string][]string{"labels": labels})
-	return string(out), err
+	return strings.Join(labels, ", "), nil
 }
 
 // NewServer serves m behind an OpenAI-compatible /chat/completions endpoint.

@@ -53,7 +53,7 @@ func newService(t *testing.T) string {
 	t.Helper()
 	llm := mockllm.NewServer(mockllm.New())
 	t.Cleanup(llm.Close)
-	svc := httptest.NewServer(handler.New(index.New(ai.NewLLMClient(llm.URL, "", "mock"))).Routes())
+	svc := httptest.NewServer(handler.New(index.New(ai.NewLLMClient(llm.URL, "", "mock"), index.Options{MaxPromptLabels: 1000, MinLabels: 5, MaxLabels: 10})).Routes())
 	t.Cleanup(svc.Close)
 	return svc.URL
 }
@@ -148,6 +148,30 @@ func TestSearch(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Score is the number of query labels the document has: 4 for the earbuds
+// (earphones, audio, sound, noise cancelling), 3 for the other noise-cancelling/earphone items, 2 for the rest.
+func TestSearchScore(t *testing.T) {
+	base := newService(t)
+	indexCorpus(t, base)
+
+	var resp struct {
+		Documents []struct {
+			ID    string
+			Score int
+		}
+	}
+	send(t, "POST", base+"/search", map[string]string{"q": "noise cancelling earbuds"}, &resp)
+	want := map[string]int{"audio-02": 4, "audio-01": 3, "audio-04": 3, "audio-03": 2, "audio-05": 2}
+	if len(resp.Documents) != len(want) {
+		t.Fatalf("got %d documents, want %d", len(resp.Documents), len(want))
+	}
+	for _, d := range resp.Documents {
+		if d.Score != want[d.ID] {
+			t.Errorf("%s score = %d, want %d", d.ID, d.Score, want[d.ID])
+		}
 	}
 }
 

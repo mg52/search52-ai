@@ -16,7 +16,11 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	idx := index.New(ai.NewLLMClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel))
+	idx := index.New(ai.NewLLMClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel), index.Options{
+		MaxPromptLabels: cfg.MaxPromptLabels,
+		MinLabels:       cfg.MinLabels,
+		MaxLabels:       cfg.MaxLabels,
+	})
 
 	addr := ":" + cfg.Port
 	log.Printf("listening on %s", addr)
