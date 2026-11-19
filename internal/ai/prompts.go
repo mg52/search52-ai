@@ -1,62 +1,64 @@
 package ai
 
 import (
+	"fmt"
 	"strconv"
 	"strings"
 )
 
-const labelsFormat = `Output ONLY the labels, lowercase, separated by commas, on a single line. No JSON, no markdown, no numbering, no explanation.
-Example: label1, label2, label3`
+// prompt is used for both documents and search queries, so both end up in the
+// same label vocabulary. The text to label is the user message.
+const prompt = `You are the indexing part of a search engine. You will get a short text. It is either a document or a search query.
+Reply with labels (search keywords) for the text.
 
-const indexPrompt = `You are a search indexing system. You will be given a document: a description and, if present, its category and other details.
-Produce the labels a user might search for to find it.
-
-Existing labels already used in the index:
-{{labels}}
-
-Rules:
-- Return between {{min}} and {{max}} labels.
-- ALWAYS reuse an existing label when it fits the document (e.g. if "earphones" exists, do not invent "earbuds"). Create a new label only when no existing one covers the topic.
-- Mix broad labels (e.g. "audio", "sound", "earphones") with specific ones (e.g. "noise cancelling earphones").
-- Labels are topics or product types, not brand names or one-off attributes.
-
-` + labelsFormat
-
-const searchPrompt = `You are a search system. You will be given a search query.
-Produce the labels of the documents the user is looking for.
-
-Existing labels in the index:
-{{labels}}
+Write the labels in this order:
+1. First the broad categories the thing belongs to (for example "kitchen", "audio", "garden"), so that a general search also finds it.
+2. Then the specific and detailed labels: the main thing, its type, its features, and the brand name if there is one.
 
 Rules:
-- Return between {{min}} and {{max}} labels.
-- Pick the existing labels that match the query. Only if none of them fit, return the closest new label.
-- Labels are topics or product types, not brand names or one-off attributes.
+- Return from 1 to {{max}} labels. You do not have to reach {{max}}: fewer labels are fine when the text needs fewer. Every label must be relevant to the text.
+- {{words}}
+- Use simple, plain words that anyone understands. Make the labels as simple and clear as possible.
+- Always write the labels in English, even if the text is in another language.
+- Output ONLY the labels on a single line, separated by commas. No explanation, no numbering, no JSON.
 
-` + labelsFormat
+Example text: Fellow electric kettle with variable temperature control
+Example output: kitchen, appliance, kettle, electric, fellow`
 
-// IndexPrompt is the system prompt that labels a document, steering the LLM
-// toward the labels the index already has and asking for min to max labels.
-// The document is the user message.
-func IndexPrompt(existing []string, min, max int) string {
-	return render(indexPrompt, existing, min, max)
+// existingLabelsBlock is appended to prompt by PromptWithLabels. prompt itself
+// is left exactly as it is.
+const existingLabelsBlock = `
+
+Labels already used in the index, most used first:
+{{labels}}
+
+When one of these labels fits the text, use it exactly as written instead of inventing a similar one. Only add a new label when none of them fits.`
+
+// Prompt is the system prompt that turns a document or a search query into
+// 1 to maxLabels labels of at most maxWords words each (<= 0: any length), broad
+// categories first.
+func Prompt(maxLabels, maxWords int) string {
+	return strings.NewReplacer("{{max}}", strconv.Itoa(maxLabels), "{{words}}", wordsRule(maxWords)).Replace(prompt)
 }
 
-// SearchPrompt is the system prompt that labels a search query against the
-// labels the index already has, asking for min to max labels. The query is the
-// user message.
-func SearchPrompt(existing []string, min, max int) string {
-	return render(searchPrompt, existing, min, max)
+func wordsRule(maxWords int) string {
+	switch {
+	case maxWords == 1:
+		return "Each label is exactly one word, lowercase, with no spaces or hyphens. Never use two words in one label."
+	case maxWords > 1:
+		return fmt.Sprintf("Each label is 1 to %d words, lowercase. Never more than %d words.", maxWords, maxWords)
+	}
+	return "Each label is a short word or phrase, lowercase."
 }
 
-func render(tmpl string, existing []string, min, max int) string {
+// PromptWithLabels is Prompt followed by the labels the index already has, which
+// the caller passes most used first. It is for when the LLM should reuse those
+// labels instead of inventing synonyms. Prompt is unchanged and is a prefix of
+// this text.
+func PromptWithLabels(maxLabels, maxWords int, existing []string) string {
 	list := "(none yet)"
 	if len(existing) > 0 {
 		list = strings.Join(existing, ", ")
 	}
-	return strings.NewReplacer(
-		"{{labels}}", list,
-		"{{min}}", strconv.Itoa(min),
-		"{{max}}", strconv.Itoa(max),
-	).Replace(tmpl)
+	return Prompt(maxLabels, maxWords) + strings.ReplaceAll(existingLabelsBlock, "{{labels}}", list)
 }

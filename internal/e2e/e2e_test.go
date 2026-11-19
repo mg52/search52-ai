@@ -26,26 +26,26 @@ type doc struct {
 // corpus is the 20 documents indexed by every test, with the labels the mock
 // LLM is expected to produce for each.
 var corpus = []doc{
-	{"audio-01", "Sony WH-1000XM5 wireless over-ear headphones with industry-leading active noise cancellation.", []string{"audio", "sound", "headphones", "noise cancelling"}},
-	{"audio-02", "Bose QuietComfort earbuds with adjustable noise cancelling and a secure in-ear fit for workouts.", []string{"audio", "sound", "earphones", "noise cancelling"}},
-	{"audio-03", "Sennheiser HD 660S open-back audiophile headphones tuned for natural stereo sound.", []string{"audio", "sound", "headphones"}},
-	{"audio-04", "Apple AirPods Pro with adaptive transparency mode and spatial audio.", []string{"audio", "sound", "earphones"}},
-	{"audio-05", "JBL Flip portable bluetooth speaker with a waterproof design.", []string{"audio", "sound", "speakers"}},
-	{"kitchen-01", "Ninja 1000W blender that crushes ice for frozen drinks.", []string{"kitchen", "appliances", "blender"}},
+	{"audio-01", "Sony WH-1000XM5 wireless over-ear headphones with industry-leading active noise cancellation.", []string{"audio", "sound", "headphone", "cancelling"}},
+	{"audio-02", "Bose QuietComfort earbuds with adjustable noise cancelling and a secure in-ear fit for workouts.", []string{"audio", "sound", "earphone", "cancelling"}},
+	{"audio-03", "Sennheiser HD 660S open-back audiophile headphones tuned for natural stereo sound.", []string{"audio", "sound", "headphone"}},
+	{"audio-04", "Apple AirPods Pro with adaptive transparency mode and spatial audio.", []string{"audio", "sound", "earphone"}},
+	{"audio-05", "JBL Flip portable bluetooth speaker with a waterproof design.", []string{"audio", "sound", "speaker"}},
+	{"kitchen-01", "Ninja 1000W blender that crushes ice for frozen drinks.", []string{"kitchen", "appliance", "blender"}},
 	{"kitchen-02", "Wusthof forged chef knife with a razor sharp edge.", []string{"kitchen", "cutlery", "knife"}},
 	{"kitchen-03", "Lodge pre-seasoned cast iron skillet for searing and baking.", []string{"kitchen", "cookware", "skillet"}},
-	{"kitchen-04", "Breville espresso machine with a built-in conical burr grinder.", []string{"kitchen", "appliances", "coffee"}},
-	{"kitchen-05", "Fellow electric kettle with variable temperature control.", []string{"kitchen", "appliances", "kettle"}},
-	{"medical-01", "Omron upper arm blood pressure monitor with irregular heartbeat detection.", []string{"medical", "health", "blood pressure monitor"}},
+	{"kitchen-04", "Breville espresso machine with a built-in conical burr grinder.", []string{"kitchen", "appliance", "coffee"}},
+	{"kitchen-05", "Fellow electric kettle with variable temperature control.", []string{"kitchen", "appliance", "kettle"}},
+	{"medical-01", "Omron upper arm blood pressure monitor with irregular heartbeat detection.", []string{"medical", "health", "tonometer"}},
 	{"medical-02", "Digital infrared thermometer for fast contactless fever checks.", []string{"medical", "health", "thermometer"}},
-	{"medical-03", "Fingertip pulse oximeter showing blood oxygen saturation and pulse rate.", []string{"medical", "health", "pulse oximeter"}},
+	{"medical-03", "Fingertip pulse oximeter showing blood oxygen saturation and pulse rate.", []string{"medical", "health", "oximeter"}},
 	{"medical-04", "Littmann classic stethoscope for clinical auscultation.", []string{"medical", "health", "stethoscope"}},
 	{"garden-01", "Expandable 50ft garden hose with brass fittings.", []string{"gardening", "outdoor", "hose"}},
 	{"garden-02", "Bypass pruner with an ergonomic grip for trimming roses.", []string{"gardening", "outdoor", "pruner"}},
 	{"garden-03", "Cedar raised bed planter for growing vegetables.", []string{"gardening", "outdoor", "planter"}},
-	{"dev-01", "Keychron mechanical keyboard with hot-swappable switches.", []string{"developer tools", "keyboard"}},
-	{"dev-02", "Lightweight code editor with built-in git and debugging.", []string{"developer tools", "code editor"}},
-	{"dev-03", "Anker USB-C hub with HDMI and ethernet ports for laptops.", []string{"developer tools", "hardware", "usb hub"}},
+	{"dev-01", "Keychron mechanical keyboard with hot-swappable switches.", []string{"developer", "keyboard"}},
+	{"dev-02", "Lightweight code editor with built-in git and debugging.", []string{"developer", "editor"}},
+	{"dev-03", "Anker USB-C hub with HDMI and ethernet ports for laptops.", []string{"developer", "hardware", "hub"}},
 }
 
 // newService starts the full service on a mock LLM and returns its base URL.
@@ -53,7 +53,7 @@ func newService(t *testing.T) string {
 	t.Helper()
 	llm := mockllm.NewServer(mockllm.New())
 	t.Cleanup(llm.Close)
-	svc := httptest.NewServer(handler.New(index.New(ai.NewLLMClient(llm.URL, "", "mock"), index.Options{MaxPromptLabels: 1000, MinLabels: 5, MaxLabels: 10})).Routes())
+	svc := httptest.NewServer(handler.New(index.New(ai.NewLLMClient(llm.URL, "", "mock"), index.Options{MaxLabels: 50, MaxLabelWords: 1, MinLabelDocs: 5, MaxResults: 100, MinRelativeScore: 0.2})).Routes())
 	t.Cleanup(svc.Close)
 	return svc.URL
 }
@@ -122,7 +122,7 @@ func TestSearch(t *testing.T) {
 		query string
 		want  []string
 	}{
-		// earphones+audio+sound+noise cancelling: audio-02 shares 4, audio-01/04 share 3, the rest 2.
+		// audio-02 has all 4 query labels, audio-01/04 three, the rest two (see TestSearchScore).
 		{"noise cancelling earbuds", []string{"audio-02", "audio-01", "audio-04", "audio-03", "audio-05"}},
 		{"bluetooth speaker", []string{"audio-05", "audio-01", "audio-02", "audio-03", "audio-04"}},
 		{"blood pressure", []string{"medical-01", "medical-02", "medical-03", "medical-04"}},
@@ -151,8 +151,8 @@ func TestSearch(t *testing.T) {
 	}
 }
 
-// Score is the number of query labels the document has: 4 for the earbuds
-// (earphones, audio, sound, noise cancelling), 3 for the other noise-cancelling/earphone items, 2 for the rest.
+// The query's labels have 5 (audio), 5 (sound), 2 (earphone) and 2 (cancelling)
+// documents: total 14. Labels with fewer than 5 docs count as 5, so all weigh 2.8.
 func TestSearchScore(t *testing.T) {
 	base := newService(t)
 	indexCorpus(t, base)
@@ -160,17 +160,17 @@ func TestSearchScore(t *testing.T) {
 	var resp struct {
 		Documents []struct {
 			ID    string
-			Score int
+			Score float64
 		}
 	}
 	send(t, "POST", base+"/search", map[string]string{"q": "noise cancelling earbuds"}, &resp)
-	want := map[string]int{"audio-02": 4, "audio-01": 3, "audio-04": 3, "audio-03": 2, "audio-05": 2}
+	want := map[string]float64{"audio-02": 11.2, "audio-01": 8.4, "audio-04": 8.4, "audio-03": 5.6, "audio-05": 5.6}
 	if len(resp.Documents) != len(want) {
 		t.Fatalf("got %d documents, want %d", len(resp.Documents), len(want))
 	}
 	for _, d := range resp.Documents {
 		if d.Score != want[d.ID] {
-			t.Errorf("%s score = %d, want %d", d.ID, d.Score, want[d.ID])
+			t.Errorf("%s score = %v, want %v", d.ID, d.Score, want[d.ID])
 		}
 	}
 }
@@ -242,4 +242,45 @@ func contains(s []string, v string) bool {
 		}
 	}
 	return false
+}
+
+// The response carries the query's normalized labels.
+func TestSearchResponseLabels(t *testing.T) {
+	base := newService(t)
+	indexCorpus(t, base)
+
+	resp, _ := search(t, base, "blood pressure")
+	if want := []string{"medical", "health", "tonometer"}; !reflect.DeepEqual(resp.Labels, want) {
+		t.Errorf("labels = %v, want %v", resp.Labels, want)
+	}
+}
+
+// Query labels that no document has are not an error: 200 with no documents.
+func TestSearchLabelsNotInIndex(t *testing.T) {
+	base := newService(t)
+	send(t, "POST", base+"/documents", map[string]string{"id": "a", "content": "Sony headphones"}, nil)
+
+	resp, code := search(t, base, "garden hose")
+	if code != http.StatusOK || len(resp.Documents) != 0 || len(resp.Labels) == 0 {
+		t.Errorf("status %d, labels %v, docs %v; want 200, labels, no docs", code, resp.Labels, resp.Documents)
+	}
+}
+
+// A document the LLM gives no labels fails alone; the rest of the batch is indexed.
+func TestBatchLabelingFailure(t *testing.T) {
+	base := newService(t)
+	var resp struct {
+		Indexed, Failed int
+		Errors          []struct{ ID string }
+	}
+	docs := []map[string]string{
+		{"id": "ok", "content": "Garden hose"},
+		{"id": "nolabels", "content": "quantum physics"},
+	}
+	if code := send(t, "POST", base+"/documents/batch", map[string]any{"documents": docs}, &resp); code != http.StatusCreated {
+		t.Fatalf("status %d", code)
+	}
+	if resp.Indexed != 1 || resp.Failed != 1 || len(resp.Errors) != 1 || resp.Errors[0].ID != "nolabels" {
+		t.Errorf("resp = %+v", resp)
+	}
 }

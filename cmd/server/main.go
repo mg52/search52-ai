@@ -16,10 +16,15 @@ func main() {
 		log.Fatalf("config: %v", err)
 	}
 
-	idx := index.New(ai.NewLLMClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel), index.Options{
-		MaxPromptLabels: cfg.MaxPromptLabels,
-		MinLabels:       cfg.MinLabels,
-		MaxLabels:       cfg.MaxLabels,
+	llm := ai.NewLLMClient(cfg.LLMBaseURL, cfg.LLMAPIKey, cfg.LLMModel)
+	llm.Timeout, llm.MaxAttempts, llm.ReasoningEffort, llm.Temperature, llm.MaxTokens = cfg.LLMTimeout, cfg.LLMMaxAttempts, cfg.LLMReasoningEffort, cfg.LLMTemperature, cfg.LLMMaxTokens
+	idx := index.New(llm, index.Options{
+		MaxLabels:          cfg.MaxLabels,
+		MaxLabelWords:      cfg.MaxLabelWords,
+		MinLabelDocs:       cfg.MinLabelDocs,
+		MaxResults:         cfg.MaxResults,
+		MinRelativeScore:   cfg.MinRelativeScore,
+		SendExistingLabels: cfg.SendExistingLabels,
 	})
 
 	addr := ":" + cfg.Port

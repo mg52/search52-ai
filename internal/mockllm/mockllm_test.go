@@ -10,7 +10,7 @@ import (
 func TestComplete(t *testing.T) {
 	m := New()
 	tests := []struct{ text, want string }{
-		{"Bose earbuds with noise cancelling", "audio, sound, earphones, noise cancelling"},
+		{"Bose earbuds with noise cancelling", "audio, sound, earphones, cancelling"},
 		{"QUANTUM PHYSICS", ""},
 	}
 	for _, tc := range tests {
@@ -25,7 +25,7 @@ func TestServerWorksWithRealClient(t *testing.T) {
 	srv := NewServer(New())
 	defer srv.Close()
 
-	got, err := ai.NewLLMClient(srv.URL, "", "mock").Complete(context.Background(), ai.SearchPrompt(nil, 5, 10), "garden hose")
+	got, err := ai.NewLLMClient(srv.URL, "", "mock").Complete(context.Background(), ai.Prompt(50, 1), "garden hose")
 	if err != nil {
 		t.Fatalf("Complete: %v", err)
 	}

@@ -23,7 +23,7 @@ type Rule struct {
 var DefaultRules = []Rule{
 	{[]string{"headphone"}, []string{"audio", "sound", "headphones"}},
 	{[]string{"earbud", "airpods"}, []string{"audio", "sound", "earphones"}},
-	{[]string{"noise cancel"}, []string{"noise cancelling"}},
+	{[]string{"noise cancel"}, []string{"cancelling"}},
 	{[]string{"speaker"}, []string{"audio", "sound", "speakers"}},
 
 	{[]string{"blender", "smoothie"}, []string{"kitchen", "appliances", "blender"}},
@@ -32,18 +32,18 @@ var DefaultRules = []Rule{
 	{[]string{"espresso"}, []string{"kitchen", "appliances", "coffee"}},
 	{[]string{"kettle"}, []string{"kitchen", "appliances", "kettle"}},
 
-	{[]string{"blood pressure"}, []string{"medical", "health", "blood pressure monitor"}},
+	{[]string{"blood pressure"}, []string{"medical", "health", "tonometer"}},
 	{[]string{"thermometer"}, []string{"medical", "health", "thermometer"}},
-	{[]string{"oximeter"}, []string{"medical", "health", "pulse oximeter"}},
+	{[]string{"oximeter"}, []string{"medical", "health", "oximeter"}},
 	{[]string{"stethoscope"}, []string{"medical", "health", "stethoscope"}},
 
 	{[]string{"garden hose"}, []string{"gardening", "outdoor", "hose"}},
 	{[]string{"pruner"}, []string{"gardening", "outdoor", "pruner"}},
 	{[]string{"planter"}, []string{"gardening", "outdoor", "planter"}},
 
-	{[]string{"keyboard"}, []string{"developer tools", "keyboard"}},
-	{[]string{"code editor"}, []string{"developer tools", "code editor"}},
-	{[]string{"usb-c hub"}, []string{"developer tools", "hardware", "usb hub"}},
+	{[]string{"keyboard"}, []string{"developer", "keyboard"}},
+	{[]string{"code editor"}, []string{"developer", "editor"}},
+	{[]string{"usb-c hub"}, []string{"developer", "hardware", "hub"}},
 }
 
 // LLM labels text with the labels of every rule it matches. Text matching no

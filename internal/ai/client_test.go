@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func chatServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
@@ -101,5 +102,101 @@ func TestCompleteNoAuthHeaderWhenKeyEmpty(t *testing.T) {
 	}
 	if hadAuth {
 		t.Fatal("Authorization header should be omitted when apiKey is empty")
+	}
+}
+
+// The reasoning_effort field defaults to "none" and is left out when empty.
+func TestCompleteReasoningEffort(t *testing.T) {
+	var got map[string]any
+	srv := chatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = map[string]any{}
+		json.NewDecoder(r.Body).Decode(&got)
+		okReply(w, "ok")
+	})
+	c := NewLLMClient(srv.URL, "k", "m")
+	c.Complete(context.Background(), "sys", "usr")
+	if got["reasoning_effort"] != "none" {
+		t.Errorf("default reasoning_effort = %v, want none", got["reasoning_effort"])
+	}
+	c.ReasoningEffort = ""
+	c.Complete(context.Background(), "sys", "usr")
+	if _, ok := got["reasoning_effort"]; ok {
+		t.Errorf("empty ReasoningEffort should omit the field, got %v", got)
+	}
+}
+
+// MaxAttempts is the total number of tries, and Timeout limits each one.
+func TestCompleteMaxAttemptsAndTimeout(t *testing.T) {
+	var calls int32
+	srv := chatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&calls, 1)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	c := NewLLMClient(srv.URL, "k", "m")
+	c.MaxAttempts = 1
+	if _, err := c.Complete(context.Background(), "sys", "usr"); err == nil || atomic.LoadInt32(&calls) != 1 {
+		t.Errorf("MaxAttempts 1: err=%v calls=%d, want an error after 1 call", err, calls)
+	}
+
+	slow := chatServer(t, func(w http.ResponseWriter, r *http.Request) { time.Sleep(300 * time.Millisecond) })
+	c = NewLLMClient(slow.URL, "k", "m")
+	c.MaxAttempts, c.Timeout = 1, 50*time.Millisecond
+	if _, err := c.Complete(context.Background(), "sys", "usr"); err == nil {
+		t.Error("expected a timeout error")
+	}
+}
+
+// temperature is always sent: 0 by default, the configured value otherwise.
+func TestCompleteTemperature(t *testing.T) {
+	var got map[string]any
+	srv := chatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = map[string]any{}
+		json.NewDecoder(r.Body).Decode(&got)
+		okReply(w, "ok")
+	})
+	c := NewLLMClient(srv.URL, "k", "m")
+	c.Complete(context.Background(), "sys", "usr")
+	if v, ok := got["temperature"]; !ok || v != float64(0) {
+		t.Errorf("default temperature = %v (present %v), want 0 sent", v, ok)
+	}
+	c.Temperature = 0.7
+	c.Complete(context.Background(), "sys", "usr")
+	if got["temperature"] != 0.7 {
+		t.Errorf("temperature = %v, want 0.7", got["temperature"])
+	}
+}
+
+// max_tokens is sent (300 by default) and left out when 0.
+func TestCompleteMaxTokens(t *testing.T) {
+	var got map[string]any
+	srv := chatServer(t, func(w http.ResponseWriter, r *http.Request) {
+		got = map[string]any{}
+		json.NewDecoder(r.Body).Decode(&got)
+		okReply(w, "ok")
+	})
+	c := NewLLMClient(srv.URL, "k", "m")
+	c.Complete(context.Background(), "sys", "usr")
+	if got["max_tokens"] != float64(300) {
+		t.Errorf("default max_tokens = %v, want 300", got["max_tokens"])
+	}
+	c.MaxTokens = 0
+	c.Complete(context.Background(), "sys", "usr")
+	if _, ok := got["max_tokens"]; ok {
+		t.Errorf("MaxTokens 0 should omit the field, got %v", got)
+	}
+}
+
+// A reply cut off by max_tokens loses its last label, which may be half written.
+func TestCompleteTruncatedReply(t *testing.T) {
+	for finish, want := range map[string]string{"length": "kitchen, appliance", "stop": "kitchen, appliance, ket"} {
+		srv := chatServer(t, func(w http.ResponseWriter, r *http.Request) {
+			json.NewEncoder(w).Encode(map[string]any{
+				"choices": []map[string]any{{"finish_reason": finish, "message": map[string]any{"content": "kitchen, appliance, ket"}}},
+			})
+		})
+		got, err := NewLLMClient(srv.URL, "k", "m").Complete(context.Background(), "sys", "usr")
+		if err != nil || got != want {
+			t.Errorf("finish_reason %q: got %q, %v; want %q", finish, got, err, want)
+		}
 	}
 }

@@ -53,13 +53,13 @@ func (h *Handler) createDocument(w http.ResponseWriter, r *http.Request) {
 		jsonError(w, msg, http.StatusBadRequest)
 		return
 	}
-	doc, err := h.idx.Add(r.Context(), req.ID, req.Content)
+	labels, err := h.idx.Add(r.Context(), req.ID, req.Content)
 	if err != nil {
 		log.Printf("handler: add %s: %v", req.ID, err)
 		jsonError(w, "labeling failed: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
-	jsonResponse(w, doc, http.StatusCreated)
+	jsonResponse(w, map[string]any{"id": req.ID, "content": req.Content, "labels": labels}, http.StatusCreated)
 }
 
 type batchError struct {

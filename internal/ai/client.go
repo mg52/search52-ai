@@ -9,6 +9,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -18,28 +19,52 @@ type LLMClient struct {
 	apiKey  string
 	model   string
 	http    *http.Client
+
+	// Timeout limits one attempt. Chat completions can run far longer than
+	// embeddings, especially against local/self-hosted reasoning models whose
+	// generation time is large and highly variable, so the default is generous.
+	Timeout time.Duration
+	// MaxAttempts is how many times a call is tried in total; only transient
+	// failures (network, 5xx, 408, 429) are retried, with exponential backoff.
+	MaxAttempts int
+	// ReasoningEffort is sent as "reasoning_effort". "none" switches off
+	// chain-of-thought output on reasoning models (OpenAI o-series, Qwen3/3.5
+	// via Ollama): the labelling prompt is a fixed task, so reasoning tokens
+	// only add latency. Empty omits the field, for endpoints that reject it.
+	ReasoningEffort string
+	// Temperature is the sampling temperature. 0 makes the labels as repeatable
+	// as the model allows, which matters because documents and queries must end
+	// up with the same label vocabulary. It is always sent, 0 included.
+	Temperature float64
+	// MaxTokens limits the length of one reply, sent as "max_tokens" (<= 0 omits
+	// it). A label list is short, so this mostly stops a model that never ends the
+	// list (a repetition loop) from running for minutes.
+	MaxTokens int
 }
 
+// NewLLMClient returns a client with the defaults: 10 minute timeout, 3
+// attempts, reasoning effort "none", temperature 0, 300 max tokens. Set the exported fields to
+// change them.
 func NewLLMClient(baseURL, apiKey, model string) *LLMClient {
 	return &LLMClient{
-		baseURL: baseURL,
-		apiKey:  apiKey,
-		model:   model,
-		// Chat completions can run far longer than embeddings, especially
-		// against local/self-hosted reasoning models whose generation time
-		// is large and highly variable — 60s cuts those off before they
-		// ever finish.
-		http: &http.Client{Timeout: 10 * time.Minute},
+		baseURL:         baseURL,
+		apiKey:          apiKey,
+		model:           model,
+		http:            &http.Client{},
+		Timeout:         10 * time.Minute,
+		MaxAttempts:     3,
+		ReasoningEffort: "none",
+		MaxTokens:       300,
 	}
 }
 
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Messages []chatMessage `json:"messages"`
-	// ReasoningEffort disables chain-of-thought output on reasoning models
-	// (OpenAI o-series, Qwen3/3.5 via Ollama). This index's prompts are fixed
-	// classification tasks — reasoning tokens only add latency, not quality.
-	ReasoningEffort string `json:"reasoning_effort"`
+	Model           string        `json:"model"`
+	Messages        []chatMessage `json:"messages"`
+	ReasoningEffort string        `json:"reasoning_effort,omitempty"`
+	// No omitempty: temperature 0 must be sent, or the server uses its own default.
+	Temperature float64 `json:"temperature"`
+	MaxTokens   int     `json:"max_tokens,omitempty"`
 }
 
 type chatMessage struct {
@@ -52,6 +77,7 @@ type chatResponse struct {
 		Message struct {
 			Content string `json:"content"`
 		} `json:"message"`
+		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
@@ -64,10 +90,14 @@ func (c *LLMClient) Complete(ctx context.Context, system, user string) (string, 
 			{Role: "system", Content: system},
 			{Role: "user", Content: user},
 		},
-		ReasoningEffort: "none",
+		ReasoningEffort: c.ReasoningEffort,
+		Temperature:     c.Temperature,
+		MaxTokens:       c.MaxTokens,
 	}
 	var resp chatResponse
-	err := retry(ctx, 3, func() error {
+	err := retry(ctx, c.MaxAttempts, func() error {
+		ctx, cancel := context.WithTimeout(ctx, c.Timeout)
+		defer cancel()
 		return postJSON(ctx, c.http, c.baseURL+"/chat/completions", c.apiKey, req, &resp)
 	})
 	if err != nil {
@@ -76,7 +106,14 @@ func (c *LLMClient) Complete(ctx context.Context, system, user string) (string, 
 	if len(resp.Choices) == 0 {
 		return "", fmt.Errorf("empty choices in LLM response")
 	}
-	return resp.Choices[0].Message.Content, nil
+	content := resp.Choices[0].Message.Content
+	if resp.Choices[0].FinishReason == "length" {
+		// Cut off by MaxTokens: the last label may be half written, drop it.
+		if i := strings.LastIndex(content, ","); i >= 0 {
+			content = content[:i]
+		}
+	}
+	return content, nil
 }
 
 func postJSON(ctx context.Context, client *http.Client, url, apiKey string, body, out any) error {

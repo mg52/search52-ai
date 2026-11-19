@@ -20,7 +20,7 @@ func (fakeLLM) Complete(_ context.Context, _, user string) (string, error) {
 
 func do(t *testing.T, method, path, body string) *httptest.ResponseRecorder {
 	t.Helper()
-	h := New(index.New(fakeLLM{}, index.Options{MaxPromptLabels: 1000, MinLabels: 5, MaxLabels: 10}))
+	h := New(index.New(fakeLLM{}, index.Options{MaxLabels: 50}))
 	return doWith(t, h, method, path, body)
 }
 
@@ -40,7 +40,7 @@ func TestCreateDocumentValidation(t *testing.T) {
 }
 
 func TestIndexSearchDelete(t *testing.T) {
-	h := New(index.New(fakeLLM{}, index.Options{MaxPromptLabels: 1000, MinLabels: 5, MaxLabels: 10}))
+	h := New(index.New(fakeLLM{}, index.Options{MaxLabels: 50}))
 	if w := doWith(t, h, "POST", "/documents", `{"id": "a", "content": "audio gear"}`); w.Code != http.StatusCreated {
 		t.Fatalf("create: %d %s", w.Code, w.Body)
 	}
